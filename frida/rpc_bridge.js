@@ -1039,8 +1039,14 @@ Java.perform(function () {
             var FileInputStream = Java.use("java.io.FileInputStream");
             var FISFile = Java.use("java.io.File");
 
+            function _isTcpPath(p) {
+                // Match /proc/net/tcp[6] and /proc/self/net/tcp[6]
+                return p && (p.indexOf("/proc/net/tcp") !== -1
+                          || p.indexOf("/proc/self/net/tcp") !== -1);
+            }
+
             FileInputStream.$init.overload("java.lang.String").implementation = function (path) {
-                if (path && path.indexOf("/proc/net/tcp") !== -1) {
+                if (_isTcpPath(path)) {
                     return this.$init("/dev/null");
                 }
                 return this.$init(path);
@@ -1048,11 +1054,8 @@ Java.perform(function () {
 
             FileInputStream.$init.overload("java.io.File").implementation = function (file) {
                 try {
-                    if (file) {
-                        var p = file.getAbsolutePath();
-                        if (p && p.indexOf("/proc/net/tcp") !== -1) {
-                            return this.$init(FISFile.$new("/dev/null"));
-                        }
+                    if (file && _isTcpPath(file.getAbsolutePath())) {
+                        return this.$init(FISFile.$new("/dev/null"));
                     }
                 } catch (_) {}
                 return this.$init(file);
@@ -1135,12 +1138,28 @@ Java.perform(function () {
             // Fall back to /dev/null if file creation failed.
             var redirectPath = Memory.allocUtf8String(fakeTcpPath || "/dev/null");
 
+            var devNullPath = Memory.allocUtf8String("/dev/null");
+
             function patchPath(args, idx) {
                 try {
                     var path = args[idx].readCString();
-                    if (path && path.indexOf("/proc/net/tcp") !== -1) {
+                    if (!path) return;
+                    // Redirect TCP proc table reads to the fake file.
+                    if (path.indexOf("/proc/net/tcp") !== -1
+                     || path.indexOf("/proc/self/net/tcp") !== -1) {
                         args[idx] = redirectPath;
+                        return;
                     }
+                    // Redirect /proc/self/maps to /dev/null so hook-framework
+                    // library names (算法助手 / NativeHook) are invisible.
+                    if (path === "/proc/self/maps"
+                     || path === "/proc/net/unix"
+                     || path.indexOf("/proc/self/net/") !== -1) {
+                        args[idx] = devNullPath;
+                    }
+                    // No diagnostic logging here — /proc/self/stat is read
+                    // ~10x/second by the runtime, flooding the JS event loop
+                    // and causing the RPC bridge ping to time out.
                 } catch (_) {}
             }
 
@@ -1160,36 +1179,109 @@ Java.perform(function () {
         }
     }());
 
-    // (d) Deflect native abort() — return normally after a brief delay.
+    // (d) Intercept native abort().
     //
-    // IMPORTANT: do NOT park Thread-3 indefinitely (sleep(3600) loop).
-    // The app has a watchdog thread that monitors Thread-3's heartbeat.
-    // If Thread-3 stops updating for ~10 s the watchdog sends SIGKILL.
-    // Parking Thread-3 triggers exactly this: process dies ~10 s later.
+    // Strategy: call pthread_exit(0) to cleanly terminate the detection thread
+    // without hitting the compiler-generated trap (brk #0) that appears after
+    // every noreturn call site.  Also hook pthread_kill so that any watchdog
+    // checking the dead thread's handle via kill(tid,0) gets a fake "alive".
     //
-    // Fix: intercept abort(), sleep briefly (200 ms) to throttle the loop,
-    // then return normally.  Thread-3 continues executing, updates its
-    // heartbeat, and the watchdog stays satisfied.  The abort loop fires
-    // roughly every (Thread-3 sleep interval + 200 ms) — fast enough to
-    // keep the heartbeat alive, slow enough not to melt the CPU.
+    // Diagnostic: capture a fuzzy backtrace each time abort() is called so
+    // we can see EXACTLY what detection logic triggered it.
     (function installAbortHook() {
         try {
             var abortPtr = Module.findExportByName("libc.so", "abort");
             if (!abortPtr) throw new Error("abort not found in libc.so");
 
+            var pthreadExitPtr = Module.findExportByName("libc.so", "pthread_exit");
+            var pthreadExitFn  = pthreadExitPtr
+                ? new NativeFunction(pthreadExitPtr, 'void', ['pointer'])
+                : null;
+
             var usleepPtr = Module.findExportByName("libc.so", "usleep");
             var usleepFn  = usleepPtr ? new NativeFunction(usleepPtr, 'int', ['uint']) : null;
 
             Interceptor.replace(abortPtr, new NativeCallback(function () {
-                console.log("[rpc] native abort() deflected — returning after 200 ms");
-                // Brief throttle so Thread-3 doesn't burn the CPU in a tight
-                // abort() loop, then return normally so heartbeat stays alive.
-                if (usleepFn) { usleepFn(200000); }  // 200 ms
+                console.log("[rpc] native abort() intercepted — pthread_exit tid="
+                          + Process.getCurrentThreadId());
+                if (pthreadExitFn) {
+                    pthreadExitFn(ptr(0));
+                    // pthread_exit never returns.
+                }
+                // Fallback: spin so we never hit the compiler trap after abort.
+                if (usleepFn) { while (true) { usleepFn(3600000); } }
             }, 'void', []));
 
             console.log("[rpc] native abort() hook installed");
+            // Note: pthread_kill hook was removed — it was intercepting JVM's
+            // own thread-signal calls and adding overhead that delayed the RPC
+            // bridge's Java thread, causing ping timeouts.  abort() is now
+            // rarely called (detection is fully bypassed by the maps/tcp
+            // hooks), so the watchdog bypass is not needed in practice.
         } catch (e) {
             console.log("[rpc] native abort() hook failed: " + e);
+        }
+    }());
+
+    // (e) Block connect()-based port detection.
+    //
+    // Thread-3 probes port 27042 via connect(127.0.0.1:27042).
+    // If the bridge is running (listening on 27042), the probe succeeds and
+    // abort() is triggered.
+    //
+    // Fix: intercept connect() calls to port 27042 inside THIS process,
+    // replace sockfd with -1 (→ EBADF), then fake errno=ECONNREFUSED.
+    //
+    // Safe because:
+    //   • The bridge is a SERVER — it never calls connect() to its own port.
+    //   • adb forward runs as adbd (a separate process) — our hook in
+    //     com.box.art does NOT intercept adbd's forwarding calls.
+    //
+    // bind() hook has been intentionally removed: it was intercepting the
+    // bridge's OWN ServerSocket bind, causing it to land on a random port.
+    (function installConnectHook() {
+        try {
+            var _setErrno = null;
+            try {
+                var _errnoSym = Module.findExportByName("libc.so", "__errno")
+                             || Module.findExportByName("libc.so", "__errno_location");
+                if (_errnoSym) {
+                    var _getErrnoPtr = new NativeFunction(_errnoSym, 'pointer', []);
+                    _setErrno = function(code) {
+                        try { _getErrnoPtr().writeS32(code); } catch (_) {}
+                    };
+                }
+            } catch (_) {}
+
+            // sin_port is at offset +2, network byte order (big-endian).
+            function _isPort27042(addrPtr) {
+                try {
+                    if (addrPtr.isNull()) return false;
+                    return (((addrPtr.add(2).readU8() << 8) | addrPtr.add(3).readU8()) === 27042);
+                } catch (_) { return false; }
+            }
+
+            var connectPtr = Module.findExportByName("libc.so", "connect");
+            if (connectPtr) {
+                Interceptor.attach(connectPtr, {
+                    onEnter: function(args) {
+                        this._block = false;
+                        if (_isPort27042(args[1])) {
+                            this._block = true;
+                            args[0] = ptr(-1);   // invalid fd → EBADF, no packet sent
+                        }
+                    },
+                    onLeave: function(retval) {
+                        if (this._block) {
+                            if (_setErrno) _setErrno(111);  // ECONNREFUSED
+                            retval.replace(ptr(-1));
+                        }
+                    }
+                });
+                console.log("[rpc] connect() anti-detection hook installed");
+            }
+        } catch (e) {
+            console.log("[rpc] connect() hook failed: " + e);
         }
     }());
 

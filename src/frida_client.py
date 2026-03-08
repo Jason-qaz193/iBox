@@ -98,7 +98,7 @@ class RPCConnection:
 
     def ping(self) -> bool:
         try:
-            r = self.call({"type": "ping"}, timeout=3)
+            r = self.call({"type": "ping"}, timeout=15)
             return r.get("ok") and r.get("msg") == "pong"
         except Exception:
             return False
