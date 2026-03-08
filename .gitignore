@@ -1,0 +1,7 @@
+config/config.yaml
+config/current_key.txt
+__pycache__/
+*.pyc
+.venv/
+venv/
+.env
