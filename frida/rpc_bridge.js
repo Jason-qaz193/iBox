@@ -324,6 +324,45 @@ function startThread(fn, name) {
     }
 }
 
+function runOnMainThreadSync(fn, timeoutMs) {
+    var Handler = Java.use("android.os.Handler");
+    var Looper = Java.use("android.os.Looper");
+    var CountDownLatch = Java.use("java.util.concurrent.CountDownLatch");
+    var latch = CountDownLatch.$new(1);
+    var state = { ok: false, value: null, error: null };
+
+    var RunnableImpl = _ensureRunnableClass();
+    if (RunnableImpl === null) {
+        throw new Error("Runnable helper unavailable");
+    }
+
+    var taskName = "main." + (++_threadSeq) + ".rpc";
+    _threadFns[taskName] = function () {
+        try {
+            state.value = fn();
+            state.ok = true;
+        } catch (e) {
+            state.error = e;
+        }
+        latch.countDown();
+    };
+
+    var handler = Handler.$new(Looper.getMainLooper());
+    handler.post(RunnableImpl.$new(taskName));
+
+    var finished = timeoutMs
+        ? latch.await(timeoutMs, Java.use("java.util.concurrent.TimeUnit").MILLISECONDS.value)
+        : true;
+    if (!finished) {
+        delete _threadFns[taskName];
+        throw new Error("main-thread call timeout");
+    }
+    if (!state.ok) {
+        throw state.error || new Error("main-thread call failed");
+    }
+    return state.value;
+}
+
 // ── Command handlers ──────────────────────────────────────────────────────────
 
 function handleCmd(cmd) {
@@ -579,258 +618,80 @@ function handleCmd(cmd) {
                 return { ok: false, error: "EncryptDataImpl not cached — trigger a request in iBox first" };
             }
             console.log("[rpc] decryptResp: inst OK");
+            var JavaString = Java.use("java.lang.String");
+            var freshDI = _decryptInstance;
 
-            // ── Step 0: call DecryptInterceptor.a(String) to fully decrypt the response.
-            //
-            // Prefer the cached _decryptInstance (set by the intercept hook on real requests)
-            // to avoid Java.choose() which triggers a heap scan and causes GC conflicts in
-            // 算法助手 that crash the app ~5s after the call.
-            // Fall back to Java.choose() only when the cached instance is unavailable.
-            console.log("[rpc] step0: acquiring DecryptInterceptor instance");
-            var freshDI = null;
-
-            // Try cached instance first (no heap scan, no GC conflict).
-            // IMPORTANT: also validate the class name.  算法助手's JS engine may store
-            // the captured `this` as a WeakReference internally; after GC the referent
-            // becomes null and getClass() returns WeakReference instead of DecryptInterceptor.
-            // In that case we must invalidate and fall back to Java.choose().
-            if (_decryptInstance !== null) {
-                try {
-                    var _diCachedCls = _decryptInstance.getClass().getName();
-                    if (_diCachedCls.indexOf("DecryptInterceptor") >= 0) {
-                        freshDI = _decryptInstance;
-                        console.log("[rpc] step0: using cached _decryptInstance (" + _diCachedCls + ")");
-                    } else {
-                        // WeakReference or wrong object — invalidate
-                        console.log("[rpc] step0: cached instance is " + _diCachedCls + " (not DI), invalidating");
-                        _decryptInstance = null;
+            // Prefer DecryptInterceptor.a(String), but avoid touching the live
+            // interceptor instance unless the method is definitely non-static.
+            try {
+                var bodyJson0 = JSON.stringify({ data: cmd.data, encryptKey: cmd.encryptKey });
+                var diAm0 = null;
+                var diRetType0 = null;
+                var diIsStatic0 = false;
+                var Modifier = Java.use("java.lang.reflect.Modifier");
+                var DIClass0 = Java.use("com.basenetwork.interceptor.DecryptInterceptor");
+                var _cls0 = DIClass0.class;
+                while (_cls0 !== null) {
+                    var _ms0 = _cls0.getDeclaredMethods();
+                    for (var _mi0 = 0; _mi0 < _ms0.length; _mi0++) {
+                        var _m0 = _ms0[_mi0];
+                        var _dpts0 = _m0.getParameterTypes();
+                        if (_dpts0.length === 1 && _dpts0[0].getName() === "java.lang.String"
+                                && _m0.getName() === "a") {
+                            _m0.setAccessible(true);
+                            diAm0 = _m0;
+                            diRetType0 = _m0.getReturnType().getName();
+                            diIsStatic0 = Modifier.isStatic(_m0.getModifiers());
+                        }
                     }
-                } catch (_stale) {
-                    _decryptInstance = null;
-                    console.log("[rpc] step0: cached instance stale, falling back to choose");
-                }
-            }
-
-            // Fallback: heap scan (safe here — no bean created yet).
-            if (freshDI === null) {
-                try {
-                    Java.choose("com.basenetwork.interceptor.DecryptInterceptor", {
-                        onMatch: function (di) { if (!freshDI) { freshDI = di; } },
-                        onComplete: function () {}
-                    });
-                } catch (chooseErr) {
-                    console.log("[rpc] step0: choose failed: " + chooseErr);
-                }
-            }
-            console.log("[rpc] step0: freshDI=" + (freshDI !== null));
-
-            if (freshDI !== null) {
-                try {
-                    // ── Try 1: call DecryptInterceptor.a(String) via the static class definition.
-                    //
-                    // Previously we looked up a(String) via freshDI.getClass().getDeclaredMethods().
-                    // That broke when freshDI's runtime class is a subclass (or a WeakReference)
-                    // that doesn't declare a(String) itself — getDeclaredMethods() won't find
-                    // inherited methods.  Using Java.use() to get the method directly avoids this.
-                    var bodyJson0 = JSON.stringify({ data: cmd.data, encryptKey: cmd.encryptKey });
-                    var diAm0 = null, diRetType0 = null, diBm0 = null;
-
-                    // Resolve a(String) from the concrete class definition (walks parent chain).
                     try {
-                        var DIClass0 = Java.use("com.basenetwork.interceptor.DecryptInterceptor");
-                        // Walk declared methods of every class in the hierarchy to find a(String).
-                        var _cls0 = DIClass0.class;
-                        while (_cls0 !== null) {
-                            var _ms0 = _cls0.getDeclaredMethods();
-                            for (var _mi0 = 0; _mi0 < _ms0.length; _mi0++) {
-                                var _dpts0 = _ms0[_mi0].getParameterTypes();
-                                var _ret0  = _ms0[_mi0].getReturnType().getName();
-                                if (_dpts0.length === 1 && _dpts0[0].getName() === "java.lang.String"
-                                        && _ms0[_mi0].getName() === "a") {
-                                    _ms0[_mi0].setAccessible(true);
-                                    diAm0 = _ms0[_mi0]; diRetType0 = _ret0;
-                                }
-                                if (_dpts0.length === 1 && _dpts0[0].getName() === "okhttp3.Response") {
-                                    _ms0[_mi0].setAccessible(true);
-                                    diBm0 = _ms0[_mi0];
-                                }
-                            }
-                            try {
-                                _cls0 = _cls0.getSuperclass();
-                                if (_cls0 !== null && _cls0.getName() === "java.lang.Object") break;
-                            } catch (_) { break; }
-                        }
-                    } catch (_e0) {
-                        console.log("[rpc] step0: method lookup err: " + _e0);
-                    }
-
-                    if (diAm0 !== null) {
-                        // Also include the full server body text if the caller supplied it,
-                        // so that a(String) receives the exact JSON the server sent (incl.
-                        // "code"/"message" fields we don't forward separately).
-                        var variants = [
-                            cmd.bodyJson || bodyJson0,  // full server response body text (preferred)
-                            bodyJson0,                   // {"data":"...","encryptKey":"..."}
-                            cmd.data,                    // just the AES-encrypted data field
-                            cmd.encryptKey               // just the RSA-encrypted key field
-                        ];
-                        for (var vi = 0; vi < variants.length; vi++) {
-                            if (!variants[vi]) continue;
-                            console.log("[rpc] step0: trying a(variant[" + vi + "])");
-                            try {
-                                var jArg = Java.use("java.lang.String").$new(variants[vi]);
-                                var r0   = diAm0.invoke(freshDI, [jArg]);
-                                console.log("[rpc] step0: a(v" + vi + ") = " + (r0 !== null ? r0.toString().substring(0, 40) : "null"));
-                                if (r0 !== null) {
-                                    if (diRetType0 === "[B") {
-                                        // byte[] return → it's a raw AES key, decrypt data with it
-                                        try {
-                                            var B64a = Java.use("android.util.Base64");
-                                            var Cia  = Java.use("javax.crypto.Cipher");
-                                            var SKSa = Java.use("javax.crypto.spec.SecretKeySpec");
-                                            var cia  = Cia.getInstance("AES/ECB/PKCS5Padding");
-                                            cia.init(2, SKSa.$new(r0, "AES"));
-                                            var pta  = Java.use("java.lang.String").$new(
-                                                cia.doFinal(B64a.decode(cmd.data, 0)), "UTF-8");
-                                            console.log("[rpc] step0: AES([B key) OK, pt=" + pta.toString().substring(0, 40));
-                                            return { ok: true, plaintext: pta.toString() };
-                                        } catch (veB) {
-                                            console.log("[rpc] step0: AES([B key) err: " + veB);
-                                        }
-                                    } else {
-                                        // String return → a(String) already returns the fully decrypted JSON
-                                        var r0Str = r0.toString();
-                                        console.log("[rpc] step0: a(v" + vi + ") is plaintext, pt=" + r0Str.substring(0, 40));
-                                        return { ok: true, plaintext: r0Str };
-                                    }
-                                }
-                            } catch (ve) {
-                                console.log("[rpc] step0: a(v" + vi + ") err: " + ve);
-                            }
-                        }
-                    }
-
-                    // ── Try 2: call b(Response) with a synthesized OkHttp Response.
-                    if (diBm0 !== null) {
-                        console.log("[rpc] step0: trying b(Response)");
-                        try {
-                            var RB0 = Java.use("okhttp3.ResponseBody");
-                            var MT0 = Java.use("okhttp3.MediaType");
-                            var rb0 = RB0.create(MT0.parse("application/json; charset=utf-8"),
-                                                  Java.use("java.lang.String").$new(bodyJson0));
-                            var Req0 = Java.use("okhttp3.Request$Builder").$new();
-                            Req0 = Req0.url("https://sail-api.ibox.art/login");
-                            var req0 = Req0.build();
-                            var Proto0 = Java.use("okhttp3.Protocol");
-                            var resp0  = Java.use("okhttp3.Response$Builder").$new()
-                                .request(req0)
-                                .protocol(Proto0.HTTP_1_1.value)
-                                .code(200)
-                                .message("OK")
-                                .body(rb0)
-                                .build();
-                            var pt0b = diBm0.invoke(freshDI, [resp0]);
-                            console.log("[rpc] step0: b(Response) result=" + (pt0b !== null ? pt0b.toString().substring(0, 40) : "null"));
-                            if (pt0b !== null) {
-                                var pt0bStr = pt0b.toString();
-                                // b() may just serialize the body — only treat as plaintext if no encryptKey field
-                                if (pt0bStr.indexOf('"encryptKey"') < 0) {
-                                    return { ok: true, plaintext: pt0bStr };
-                                }
-                                console.log("[rpc] step0: b(Response) echoed encrypted body — continuing to RSA scan");
-                            }
-                        } catch (be) {
-                            console.log("[rpc] step0: b(Response) err: " + be);
-                        }
-                    }
-
-                    // ── Try 3a: scan DecryptInterceptor (freshDI) fields for RSA private key.
-                    try {
-                        var diCls3 = freshDI.getClass();
-                        while (diCls3 !== null) {
-                            var diF3 = diCls3.getDeclaredFields();
-                            for (var dfi3 = 0; dfi3 < diF3.length; dfi3++) {
-                                diF3[dfi3].setAccessible(true);
-                                var dfv3 = diF3[dfi3].get(freshDI);
-                                var dft3 = diF3[dfi3].getType().getName();
-                                console.log("[rpc] step0: di." + diF3[dfi3].getName()
-                                    + "(" + dft3 + ")="
-                                    + (dfv3 !== null ? dfv3.toString().substring(0, 80) : "null"));
-                                if (dfv3 !== null && (dft3 === "java.security.PrivateKey"
-                                        || dfv3.getClass().getName().indexOf("RSA") >= 0
-                                        || dfv3.getClass().getName().indexOf("Private") >= 0)) {
-                                    try {
-                                        var CipherR3 = Java.use("javax.crypto.Cipher");
-                                        var cr3 = CipherR3.getInstance("RSA/ECB/PKCS1Padding");
-                                        cr3.init(2, dfv3);
-                                        var B64r3 = Java.use("android.util.Base64");
-                                        var aesKey3 = cr3.doFinal(B64r3.decode(cmd.encryptKey, 0));
-                                        console.log("[rpc] step0: di RSA OK, keyLen=" + aesKey3.length);
-                                        var c3 = CipherR3.getInstance("AES/ECB/PKCS5Padding");
-                                        c3.init(2, Java.use("javax.crypto.spec.SecretKeySpec").$new(aesKey3, "AES"));
-                                        var pt3 = Java.use("java.lang.String").$new(
-                                            c3.doFinal(B64r3.decode(cmd.data, 0)), "UTF-8");
-                                        console.log("[rpc] step0: di RSA+AES OK, pt=" + pt3.toString().substring(0, 40));
-                                        return { ok: true, plaintext: pt3.toString() };
-                                    } catch (re3) {
-                                        console.log("[rpc] step0: di RSA err: " + re3);
-                                    }
-                                }
-                            }
-                            try {
-                                diCls3 = diCls3.getSuperclass();
-                                if (diCls3 !== null && diCls3.getName() === "java.lang.Object") break;
-                            } catch (_) { break; }
-                        }
-                    } catch (e3a) {
-                        console.log("[rpc] step0: di field scan err: " + e3a);
-                    }
-
-                    // ── Try 3b: scan EncryptDataImpl fields for RSA private key.
-                    console.log("[rpc] step0: scanning EncryptDataImpl fields for RSA key");
-                    var encImplCls = inst.getClass();
-                    while (encImplCls !== null) {
-                        var encF = encImplCls.getDeclaredFields();
-                        for (var efi = 0; efi < encF.length; efi++) {
-                            encF[efi].setAccessible(true);
-                            var efv = encF[efi].get(inst);
-                            var eft = encF[efi].getType().getName();
-                            console.log("[rpc] step0: encImpl." + encF[efi].getName()
-                                + "(" + eft + ")="
-                                + (efv !== null ? efv.toString().substring(0, 60) : "null"));
-
-                            // If it's a PrivateKey, try RSA decrypt directly.
-                            if (efv !== null && (eft === "java.security.PrivateKey"
-                                    || efv.getClass().getName().indexOf("RSA") >= 0
-                                    || efv.getClass().getName().indexOf("Private") >= 0)) {
-                                try {
-                                    var CipherR = Java.use("javax.crypto.Cipher");
-                                    var cr = CipherR.getInstance("RSA/ECB/PKCS1Padding");
-                                    cr.init(2, efv);  // Cipher.DECRYPT_MODE = 2
-                                    var B64r = Java.use("android.util.Base64");
-                                    var encKeyR = B64r.decode(cmd.encryptKey, 0);
-                                    var aesKeyR = cr.doFinal(encKeyR);
-                                    console.log("[rpc] step0: RSA decrypt OK, keyLen=" + aesKeyR.length);
-                                    var cipherR = CipherR.getInstance("AES/ECB/PKCS5Padding");
-                                    var SKSr = Java.use("javax.crypto.spec.SecretKeySpec");
-                                    cipherR.init(2, SKSr.$new(aesKeyR, "AES"));
-                                    var dataR = B64r.decode(cmd.data, 0);
-                                    var ptR   = Java.use("java.lang.String").$new(cipherR.doFinal(dataR), "UTF-8");
-                                    console.log("[rpc] step0: full RSA+AES decrypt OK!");
-                                    return { ok: true, plaintext: ptR.toString() };
-                                } catch (re) {
-                                    console.log("[rpc] step0: RSA decrypt err: " + re);
-                                }
-                            }
-                        }
-                        try {
-                            encImplCls = encImplCls.getSuperclass();
-                            if (encImplCls !== null && encImplCls.getName() === "java.lang.Object") break;
-                        } catch (_) { break; }
-                    }
-                } catch (step0err) {
-                    console.log("[rpc] step0 err: " + step0err);
+                        _cls0 = _cls0.getSuperclass();
+                        if (_cls0 !== null && _cls0.getName() === "java.lang.Object") break;
+                    } catch (_) { break; }
                 }
+                console.log("[rpc] step0: a(String) found=" + (diAm0 !== null) + ", static=" + diIsStatic0
+                    + ", cachedInstance=" + (freshDI !== null));
+
+                if (diAm0 !== null && (diIsStatic0 || freshDI !== null)) {
+                    var variants = [
+                        cmd.bodyJson || bodyJson0,
+                        bodyJson0,
+                        cmd.data,
+                        cmd.encryptKey
+                    ];
+                    var diTarget = diIsStatic0 ? null : freshDI;
+                    for (var vi = 0; vi < variants.length; vi++) {
+                        if (!variants[vi]) continue;
+                        console.log("[rpc] step0: trying a(variant[" + vi + "])");
+                        try {
+                            var jArg = JavaString.$new(variants[vi]);
+                            var diArgs = Java.array("java.lang.Object", [jArg]);
+                            var r0 = diIsStatic0
+                                ? diAm0.invoke(diTarget, diArgs)
+                                : runOnMainThreadSync(function () {
+                                    return diAm0.invoke(diTarget, diArgs);
+                                }, 5000);
+                            console.log("[rpc] step0: a(v" + vi + ") = " + (r0 !== null ? r0.toString().substring(0, 40) : "null"));
+                            if (r0 !== null) {
+                                if (diRetType0 === "[B") {
+                                    var B64a = Java.use("android.util.Base64");
+                                    var Cia  = Java.use("javax.crypto.Cipher");
+                                    var SKSa = Java.use("javax.crypto.spec.SecretKeySpec");
+                                    var cia  = Cia.getInstance("AES/ECB/PKCS5Padding");
+                                    cia.init(2, SKSa.$new(r0, "AES"));
+                                    var pta  = Java.use("java.lang.String").$new(
+                                        cia.doFinal(B64a.decode(cmd.data, 0)), "UTF-8");
+                                    return { ok: true, plaintext: pta.toString() };
+                                }
+                                return { ok: true, plaintext: r0.toString() };
+                            }
+                        } catch (ve) {
+                            console.log("[rpc] step0: a(v" + vi + ") err: " + ve);
+                        }
+                    }
+                }
+            } catch (step0err) {
+                console.log("[rpc] step0 err: " + step0err);
             }
 
             // Discover all overloads of method "a" via reflection.
@@ -866,7 +727,11 @@ function handleCmd(cmd) {
             if (!byKey[ssKey]) {
                 return { ok: false, error: "a(String,String) not found. Available: " + sigList };
             }
-            var bean = byKey[ssKey].invoke(inst, [cmd.data, cmd.encryptKey]);
+            var beanArgs = Java.array("java.lang.Object", [
+                JavaString.$new(cmd.data),
+                JavaString.$new(cmd.encryptKey)
+            ]);
+            var bean = byKey[ssKey].invoke(inst, beanArgs);
             if (bean === null) {
                 return { ok: false, error: "a(String,String) returned null" };
             }
@@ -935,7 +800,8 @@ function handleCmd(cmd) {
 
             if (decryptMethod) {
                 var target = decryptTarget !== null ? decryptTarget : null;
-                var plainObj = decryptMethod.invoke(target, [bean]);
+                var decryptArgs = Java.array("java.lang.Object", [bean]);
+                var plainObj = decryptMethod.invoke(target, decryptArgs);
                 if (plainObj !== null) return { ok: true, plaintext: plainObj.toString() };
                 return { ok: false, error: decryptMethod.getName() + "(EncryptDataBean) returned null" };
             }
@@ -1387,8 +1253,9 @@ Java.perform(function () {
     (function installHttpHook() {
         function applyHook() {
             var RealCall = Java.use("okhttp3.internal.connection.RealCall");
-            RealCall.execute.implementation = function () {
-                var resp = this.execute();
+            var realCallExecute = RealCall.execute.overload();
+            realCallExecute.implementation = function () {
+                var resp = realCallExecute.call(this);
                 try {
                     var req = null;
                     try { req = this.originalRequest.value; } catch (e) {}
@@ -1439,13 +1306,14 @@ Java.perform(function () {
         // This populates _lastCapture.respDecrypted so Python can read plaintext directly.
         try {
             var DI = Java.use("com.basenetwork.interceptor.DecryptInterceptor");
-            DI.intercept.implementation = function (chain) {
+            var diIntercept = DI.intercept.overload("okhttp3.Interceptor$Chain");
+            diIntercept.implementation = function (chain) {
                 // Cache the live instance so decryptResp can call a(String) on it.
                 if (!_decryptInstance) {
                     _decryptInstance = this;
                     console.log("[rpc] cached DecryptInterceptor instance");
                 }
-                var resp = this.intercept(chain);
+                var resp = diIntercept.call(this, chain);
                 try {
                     var url = chain.request().url().toString();
                     if (url.indexOf("sail-api") !== -1 && _lastCapture) {
