@@ -53,6 +53,9 @@ class IBoxClient:
         self.token = token
         self.session.headers["Authorization"] = f"Bearer {token}"
 
+    def set_token(self, token: str):
+        self._set_token(token)
+
     def _encrypt_request(self, payload: dict) -> tuple[dict | str, dict]:
         """
         Encrypt a JSON payload.

@@ -1,7 +1,20 @@
 config/config.yaml
+config/session.json
 config/current_key.txt
 __pycache__/
 *.pyc
 .venv/
 venv/
 .env
+package/
+.DS_Store
+*.log
+
+# Android/Gradle for lsposed_rpc_module
+lsposed_rpc_module/.gradle/
+lsposed_rpc_module/.idea/
+lsposed_rpc_module/**/build/
+lsposed_rpc_module/local.properties
+lsposed_rpc_module/**/*.iml
+lsposed_rpc_module/**/*.apk
+lsposed_rpc_module/**/*.aab

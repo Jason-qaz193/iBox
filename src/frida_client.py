@@ -276,20 +276,21 @@ class IBoxRPCClient:
             self._http.headers.update(headers)
         self.token: str | None = None
 
+    def set_token(self, token: str):
+        self.token = token
+
     def _url(self, path: str) -> str:
         return self.base_url + (path if path.startswith("/") else "/" + path)
 
-    def _post(self, path: str, payload: dict) -> dict:
-        import json as _json
-
-        enc_body = encrypt_body(payload, device_host=self.device_host)
-
+    def _headers(self) -> dict:
         hdrs = dict(self._http.headers)
         hdrs["msg-id"] = f"{uuid.uuid4()}_android"
         if self.token:
             hdrs["Authorization"] = f"Bearer {self.token}"
+        return hdrs
 
-        resp = self._http.post(self._url(path), data=enc_body, headers=hdrs, timeout=30)
+    def _decode_response(self, resp: requests.Response) -> dict:
+        import json as _json
 
         try:
             body = resp.json()
@@ -322,12 +323,22 @@ class IBoxRPCClient:
 
         return body
 
+    def _request(self, method: str, path: str, payload: dict | None = None) -> dict:
+        kwargs = {
+            "headers": self._headers(),
+            "timeout": 30,
+        }
+        if payload is not None:
+            kwargs["data"] = encrypt_body(payload, device_host=self.device_host)
+        resp = self._http.request(method.upper(), self._url(path), **kwargs)
+        return self._decode_response(resp)
+
     def send_sms(
         self,
         phone: str,
         path: str = "/personal-center-service/login/sendSms",
     ) -> dict:
-        return self._post(path, {"phone": phone, "smsType": "1"})
+        return self._request("POST", path, {"phone": phone, "smsType": "1"})
 
     def login(
         self,
@@ -338,7 +349,7 @@ class IBoxRPCClient:
         enable: int = 1,
         path: str = "/personal-center-service/login/mobile",
     ) -> dict:
-        result = self._post(path, {
+        result = self._request("POST", path, {
             "mobile": mobile,
             "verificationCode": verification_code,
             "invitationCode": invitation_code,
@@ -348,11 +359,35 @@ class IBoxRPCClient:
         if isinstance(result, dict) and result.get("code") == 0:
             token = (result.get("data") or {}).get("token")
             if token:
-                self.token = token
+                self.set_token(token)
         return result
 
     def add_cart(self, path: str, payload: dict) -> dict:
-        return self._post(path, payload)
+        return self._request("POST", path, payload)
 
     def create_order(self, path: str, payload: dict = None) -> dict:
-        return self._post(path, payload or {})
+        return self._request("POST", path, payload or {})
+
+    def get_synthesis_activity_list(self, path: str) -> dict:
+        return self._request("GET", path)
+
+    def get_synthesis_activity_detail(self, path: str) -> dict:
+        return self._request("GET", path)
+
+    def get_synthesis_center(self, path: str) -> dict:
+        return self._request("GET", path)
+
+    def get_synthesis_work_status(self, path: str) -> dict:
+        return self._request("GET", path)
+
+    def submit_synthesis(self, path: str, payload: dict) -> dict:
+        return self._request("POST", path, payload)
+
+    def confirm_synthesis(self, path: str, payload: dict | None = None) -> dict:
+        return self._request("POST", path, payload or {})
+
+    def get(self, path: str) -> dict:
+        return self._request("GET", path)
+
+    def post(self, path: str, payload: dict | None = None) -> dict:
+        return self._request("POST", path, payload)
