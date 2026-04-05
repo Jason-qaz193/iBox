@@ -17,6 +17,7 @@ import os
 import sys
 import threading
 import time
+from typing import TextIO
 
 import yaml
 
@@ -292,6 +293,34 @@ def print_result(result: dict):
     print(json.dumps(result, ensure_ascii=False, indent=2))
 
 
+class TeeStream:
+    def __init__(self, *streams: TextIO):
+        self._streams = streams
+
+    def write(self, data: str):
+        for stream in self._streams:
+            stream.write(data)
+        return len(data)
+
+    def flush(self):
+        for stream in self._streams:
+            stream.flush()
+
+    def isatty(self):
+        return any(getattr(stream, "isatty", lambda: False)() for stream in self._streams)
+
+
+def setup_log_file(project_root: str) -> str:
+    logs_dir = os.path.join(project_root, "logs")
+    os.makedirs(logs_dir, exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    log_path = os.path.join(logs_dir, f"run-{timestamp}.log")
+    log_file = open(log_path, "a", encoding="utf-8", buffering=1)
+    sys.stdout = TeeStream(sys.__stdout__, log_file)
+    sys.stderr = TeeStream(sys.__stderr__, log_file)
+    return log_path
+
+
 def iter_nested_dicts(value):
     if isinstance(value, dict):
         yield value
@@ -388,13 +417,15 @@ def extract_burn_album_recipe(center_result: dict) -> dict | None:
         return None
 
     normalized_items = []
+    material_groups = []
     for burn_group in burn_albums:
         if not isinstance(burn_group, dict):
             continue
         required_count = to_int(first_present(burn_group, ("quantity", "count", "needNum", "consumeNum"))) or 0
         albums = burn_group.get("albums")
-        if not isinstance(albums, list):
+        if not isinstance(albums, list) or required_count <= 0:
             continue
+        group_items = []
         for album in albums:
             if not isinstance(album, dict):
                 continue
@@ -419,9 +450,9 @@ def extract_burn_album_recipe(center_result: dict) -> dict | None:
                     ),
                 )
             )
-            if material_id in (None, "") or required_count <= 0:
+            if material_id in (None, ""):
                 continue
-            normalized_items.append(
+            group_items.append(
                 {
                     "material_id": str(material_id),
                     "required_count": required_count,
@@ -433,6 +464,26 @@ def extract_burn_album_recipe(center_result: dict) -> dict | None:
                 }
             )
 
+        if not group_items:
+            continue
+
+        # burnAlbums behaves like "pick one material from each group", not "consume every album".
+        selected_item = max(
+            group_items,
+            key=lambda item: (
+                item["owned_count"] // item["required_count"],
+                item["owned_count"],
+            ),
+        )
+        normalized_items.append(selected_item)
+        material_groups.append(
+            {
+                "required_count": required_count,
+                "options": group_items,
+                "selected_material_id": selected_item["material_id"],
+            }
+        )
+
     if not normalized_items:
         return None
 
@@ -442,6 +493,7 @@ def extract_burn_album_recipe(center_result: dict) -> dict | None:
         "activity_id": first_present(data, ("activityId", "activityID")),
         "synthetic_count": 1,
         "materials": normalized_items,
+        "material_groups": material_groups,
         "max_times": max_times,
         "raw_recipe": {"burnAlbums": burn_albums},
     }
@@ -585,6 +637,19 @@ def summarize_synthesis_plan(candidate: dict, times: int) -> dict:
     }
 
 
+def build_material_state_signature(candidate: dict) -> tuple[tuple[str, int, int], ...]:
+    return tuple(
+        sorted(
+            (
+                item["material_id"],
+                item["required_count"],
+                item["owned_count"],
+            )
+            for item in candidate.get("materials", [])
+        )
+    )
+
+
 def extract_activity_ids(activity_list_result: dict) -> list[str]:
     ids = []
     data = (activity_list_result or {}).get("data") or {}
@@ -672,6 +737,7 @@ def submit_synthesis_with_retry(*, client, submit_path: str, payload: dict, subm
     started_at = time.monotonic()
     deadline = started_at + max(submit_window, 0)
     success_event = threading.Event()
+    stop_event = threading.Event()
     attempts_lock = threading.Lock()
     result_lock = threading.Lock()
     result = {"submit": None}
@@ -679,7 +745,7 @@ def submit_synthesis_with_retry(*, client, submit_path: str, payload: dict, subm
 
     def worker():
         worker_client = build_parallel_submit_client(client)
-        while not success_event.is_set():
+        while not success_event.is_set() and not stop_event.is_set():
             now = time.monotonic()
             if now >= deadline:
                 break
@@ -699,6 +765,12 @@ def submit_synthesis_with_retry(*, client, submit_path: str, payload: dict, subm
                     if result["submit"] is None:
                         result["submit"] = submit_result
                 success_event.set()
+                break
+            if not should_retry_synthesis_submit(submit_result):
+                stop_event.set()
+                with result_lock:
+                    if result["submit"] is None:
+                        result["submit"] = submit_result
                 break
             if retry_interval > 0:
                 sleep_for = min(retry_interval, max(deadline - time.monotonic(), 0))
@@ -737,7 +809,29 @@ def submit_synthesis_with_retry(*, client, submit_path: str, payload: dict, subm
 
 
 def is_success(result: dict) -> bool:
-    return not isinstance(result, dict) or "code" not in result or result.get("code") == 0
+    return isinstance(result, dict) and result.get("code") == 0
+
+
+def should_retry_synthesis_submit(result: dict | None) -> bool:
+    if result is None:
+        return True
+    if not isinstance(result, dict):
+        return True
+
+    code = result.get("code")
+    if code == 0:
+        return False
+
+    if code is not None:
+        return str(code) in {"429", "500", "502", "503", "504"}
+
+    raw = str(result.get("_raw", ""))
+    lowered = raw.lower()
+    if "too many requests" in lowered or "429" in lowered:
+        return True
+    if lowered.strip().startswith("<!doctype html") or lowered.strip().startswith("<html"):
+        return False
+    return True
 
 
 def is_auth_failure(result: dict | None) -> bool:
@@ -935,6 +1029,8 @@ def require_rpc(cmd: str, use_rpc: bool):
 def main():
     config = load_config()
     project_root = os.path.dirname(__file__)
+    log_path = setup_log_file(project_root)
+    print(f"[log] saving output to {log_path}")
     session_path = default_session_path(project_root)
     parser = build_parser(config)
     parsed = parser.parse_args()
@@ -1183,6 +1279,7 @@ def main():
 
                 rounds = []
                 successful_submits = []
+                successful_state_by_synthetic_id = {}
                 for round_no in range(1, max(parsed.max_rounds, 1) + 1):
                     round_entries = []
                     round_progress = False
@@ -1212,12 +1309,24 @@ def main():
 
                         candidate = choose_recipe_candidate(candidates, synthetic_id)
                         max_times = candidate.get("max_times", 0)
+                        material_state_signature = build_material_state_signature(candidate)
                         plan = summarize_synthesis_plan(candidate, max_times)
                         entry["plan"] = plan
 
                         if max_times <= 0:
                             entry["code"] = 0
                             entry["message"] = "Current materials are insufficient for this recipe."
+                            round_entries.append(entry)
+                            continue
+
+                        previous_success_state = successful_state_by_synthetic_id.get(str(synthetic_id))
+                        if previous_success_state == material_state_signature:
+                            entry["code"] = 0
+                            entry["submitted"] = False
+                            entry["message"] = (
+                                "Skipping repeated submit because the material snapshot is unchanged "
+                                "after a previous successful submission."
+                            )
                             round_entries.append(entry)
                             continue
 
@@ -1246,6 +1355,7 @@ def main():
                         round_entries.append(entry)
                         if is_success(submit_result):
                             round_progress = True
+                            successful_state_by_synthetic_id[str(synthetic_id)] = material_state_signature
                             successful_submits.append(
                                 {
                                     "round": round_no,
