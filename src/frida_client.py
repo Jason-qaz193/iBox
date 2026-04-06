@@ -391,3 +391,48 @@ class IBoxRPCClient:
 
     def post(self, path: str, payload: dict | None = None) -> dict:
         return self._request("POST", path, payload)
+
+
+# ── GeeTest captcha polling ───────────────────────────────────────────────────
+
+def poll_captcha(
+    device_host: str = RPC_HOST,
+    timeout: float = 120.0,
+    clear_before: bool = True,
+) -> dict | None:
+    """
+    Poll the LSPosed RPC module for a GeeTest V4 captcha result that was
+    captured when the user solved the slider in the iBox app.
+
+    Returns a dict with keys:
+        lot_number, pass_token, gen_time, captcha_output, captcha_id
+    or None if no result arrived within *timeout* seconds.
+
+    Set clear_before=True (default) to discard any stale captcha stored from
+    a previous synthesis before waiting for the new one.
+    """
+    if clear_before:
+        try:
+            rpc({"type": "captcha-clear"}, device_host=device_host, timeout=5.0)
+        except Exception:
+            pass
+
+    deadline = time.monotonic() + max(timeout, 0)
+    while time.monotonic() < deadline:
+        try:
+            resp = get_connection(device_host).call(
+                {"type": "captcha-latest"}, timeout=5.0
+            )
+            lot = resp.get("lot_number")
+            if resp.get("ok") and lot and lot is not None:
+                return {
+                    "lot_number":     str(lot),
+                    "pass_token":     str(resp.get("pass_token",     "")),
+                    "gen_time":       str(resp.get("gen_time",       "")),
+                    "captcha_output": str(resp.get("captcha_output", "")),
+                    "captcha_id":     str(resp.get("captcha_id",     "")),
+                }
+        except Exception:
+            pass
+        time.sleep(1.0)
+    return None

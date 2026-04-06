@@ -274,6 +274,38 @@ public class RpcServer implements Runnable {
                     return res;
                 }
 
+                // ── captcha-latest ────────────────────────────────────────────
+                // Return the last GeeTest V4 captcha result captured from the app,
+                // or {ok:true, lot_number:null} if none has been captured yet.
+                if ("captcha-latest".equals(type)) {
+                    res.put("ok", true);
+                    String lotNum = MainHook.lastCaptchaLotNumber;
+                    if (lotNum != null && !lotNum.isEmpty()) {
+                        res.put("lot_number",    MainHook.lastCaptchaLotNumber);
+                        res.put("pass_token",    MainHook.lastCaptchaPassToken);
+                        res.put("gen_time",      MainHook.lastCaptchaGenTime);
+                        res.put("captcha_output",MainHook.lastCaptchaOutput);
+                        res.put("captcha_id",    MainHook.lastCaptchaId);
+                        res.put("timestamp_ms",  MainHook.lastCaptchaTimestampMs);
+                    } else {
+                        res.put("lot_number", JSONObject.NULL);
+                    }
+                    return res;
+                }
+
+                // ── captcha-clear ─────────────────────────────────────────────
+                // Clear stored captcha so stale results are not re-used.
+                if ("captcha-clear".equals(type)) {
+                    MainHook.lastCaptchaLotNumber   = null;
+                    MainHook.lastCaptchaPassToken   = null;
+                    MainHook.lastCaptchaGenTime     = null;
+                    MainHook.lastCaptchaOutput      = null;
+                    MainHook.lastCaptchaId          = null;
+                    MainHook.lastCaptchaTimestampMs = 0;
+                    res.put("ok", true);
+                    return res;
+                }
+
                 res.put("ok", false);
                 res.put("error", "Unknown command type: " + type);
 

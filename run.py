@@ -188,6 +188,33 @@ def build_parser(config: dict | None = None) -> argparse.ArgumentParser:
         action="store_true",
         help="Only print the discovered synthesis plans without submitting",
     )
+    synthesis_auto.add_argument(
+        "--captcha-mode",
+        choices=["auto", "manual", "skip"],
+        default="manual",
+        help=(
+            "How to handle the GeeTest V4 captcha that submit triggers: "
+            "auto=try Playwright first then fall back to manual, "
+            "manual=wait for user to solve in the app (LSPosed hook captures result), "
+            "skip=do NOT call confirm (legacy broken behaviour, synthesis stays pending)"
+        ),
+    )
+    synthesis_auto.add_argument(
+        "--captcha-timeout",
+        type=float,
+        default=120.0,
+        help="Seconds to wait for captcha result (manual mode) or Playwright solve timeout",
+    )
+    synthesis_auto.add_argument(
+        "--captcha-id",
+        default="0d4b08eac1cbdcad36bbf607c5bf3e1b",
+        help="GeeTest captcha_id for iBox (default matches production app)",
+    )
+    synthesis_auto.add_argument(
+        "--captcha-headed",
+        action="store_true",
+        help="Show the browser window when using Playwright captcha auto-solve",
+    )
 
     synthesis_confirm = subparsers.add_parser("synthesis-confirm", help="Confirm synthesis with captcha params")
     add_auth_args(synthesis_confirm)
@@ -1234,6 +1261,73 @@ def main():
                 page_size=get_command_default(config, "synthesis-activity-list", "page_size", "100"),
             )
             submit_path = render_command_path(config, "synthesis-submit", "/synthesis-service/synthetic/center/submit")
+            confirm_path_template = render_command_path(
+                config,
+                "synthesis-confirm",
+                (
+                    "/synthesis-service/synthetic/center/confirm"
+                    "?uid={uid}&captcha_id={captcha_id}"
+                    "&lot_number={lot_number}&pass_token={pass_token}"
+                    "&gen_time={gen_time}&captcha_output={captcha_output}"
+                ),
+                uid="{uid}",
+                captcha_id="{captcha_id}",
+                lot_number="{lot_number}",
+                pass_token="{pass_token}",
+                gen_time="{gen_time}",
+                captcha_output="{captcha_output}",
+            )
+
+            def _get_captcha_params(synth_id: str) -> tuple[dict | None, str | None]:
+                """
+                Obtain GeeTest V4 captcha params for the given synthetic_id.
+
+                Returns (params_dict, error_message).  params_dict keys:
+                    lot_number, pass_token, gen_time, captcha_output, captcha_id
+                """
+                cap_mode    = parsed.captcha_mode
+                cap_timeout = parsed.captcha_timeout
+                cap_id      = parsed.captcha_id
+
+                # ── auto / playwright ────────────────────────────────────────
+                if cap_mode in ("auto", "playwright"):
+                    try:
+                        from src.geetest_solver import playwright_solve, check_dependencies
+                        ok, msg = check_dependencies()
+                        if not ok:
+                            raise ImportError(msg)
+                        print(f"[captcha] Auto-solving GeeTest V4 (synthetic_id={synth_id})…")
+                        result = playwright_solve(
+                            captcha_id=cap_id,
+                            timeout=cap_timeout,
+                            headed=getattr(parsed, "captcha_headed", False),
+                        )
+                        if result and result.get("lot_number"):
+                            print(f"[captcha] Auto-solved ✓  lot_number={result['lot_number'][:8]}…")
+                            return result, None
+                        raise RuntimeError(f"Playwright returned empty result: {result}")
+                    except Exception as exc:
+                        print(f"[captcha] Auto-solve failed: {exc}")
+                        if cap_mode == "playwright":
+                            return None, f"Playwright captcha solve failed: {exc}"
+                        print("[captcha] Falling back to manual mode…")
+
+                # ── manual ───────────────────────────────────────────────────
+                print(
+                    f"[captcha] Please solve the GeeTest slider captcha in the iBox app "
+                    f"(synthetic_id={synth_id})"
+                )
+                print(f"[captcha] Waiting up to {cap_timeout:.0f} s for captcha result…")
+                from src.frida_client import poll_captcha
+                params = poll_captcha(
+                    device_host=device_host,
+                    timeout=cap_timeout,
+                    clear_before=True,
+                )
+                if params:
+                    print(f"[captcha] Captured from app ✓  lot_number={params['lot_number'][:8]}…")
+                    return params, None
+                return None, f"Captcha not obtained within {cap_timeout:.0f} s"
 
             def synthesis_auto_operation():
                 activity_list_result = client.get_synthesis_activity_list(activity_list_path)
@@ -1253,6 +1347,7 @@ def main():
 
                 activity_details = []
                 synthetic_ids = []
+                synthetic_id_to_activity_id: dict[str, str] = {}
                 for activity_id in activity_ids:
                     detail_path = render_command_path(
                         config,
@@ -1263,7 +1358,10 @@ def main():
                     detail_result = client.get_synthesis_activity_detail(detail_path)
                     activity_details.append({"activity_id": activity_id, "detail": detail_result})
                     if is_success(detail_result):
-                        synthetic_ids.extend(extract_synthetic_ids(detail_result))
+                        new_ids = extract_synthetic_ids(detail_result)
+                        for sid in new_ids:
+                            synthetic_id_to_activity_id.setdefault(str(sid), str(activity_id))
+                        synthetic_ids.extend(new_ids)
 
                 synthetic_ids = list(dict.fromkeys(synthetic_ids))
                 if not synthetic_ids:
@@ -1309,6 +1407,13 @@ def main():
 
                         candidate = choose_recipe_candidate(candidates, synthetic_id)
                         max_times = candidate.get("max_times", 0)
+                        # Respect the server-side per-user synthesis cap
+                        center_data = (center_result or {}).get("data") or {}
+                        surplus_num = to_int(first_present(center_data, ("surplusNum", "remainNum", "leftNum")))
+                        max_synthetic_num = to_int(first_present(center_data, ("maxSyntheticNum", "maxNum")))
+                        server_cap = min(v for v in (surplus_num, max_synthetic_num) if v is not None) if any(v is not None for v in (surplus_num, max_synthetic_num)) else None
+                        if server_cap is not None and server_cap < max_times:
+                            max_times = server_cap
                         material_state_signature = build_material_state_signature(candidate)
                         plan = summarize_synthesis_plan(candidate, max_times)
                         entry["plan"] = plan
@@ -1352,8 +1457,53 @@ def main():
                         entry["attempt_count"] = submit_outcome["attempt_count"]
                         entry["submit_concurrency"] = submit_outcome["concurrency"]
                         entry["code"] = submit_result.get("code", 0 if is_success(submit_result) else 1)
+
+                        # ── GeeTest captcha → confirm step ────────────────────
+                        # submit code=0 means "accepted, pending captcha".
+                        # We must call /confirm with captcha params to actually
+                        # complete the synthesis.  In --captcha-mode=skip we
+                        # skip this step (legacy broken behaviour).
+                        confirmed = False
+                        if is_success(submit_result) and parsed.captcha_mode != "skip":
+                            captcha_params, captcha_err = _get_captcha_params(str(synthetic_id))
+                            if captcha_err:
+                                entry["captcha_error"] = captcha_err
+                                entry["code"] = 1
+                            else:
+                                _outer_activity_id = synthetic_id_to_activity_id.get(str(synthetic_id), "")
+                                print(f"[confirm] synthetic_id={synthetic_id}  outer_activity_id={_outer_activity_id!r}  synthetic_num={max_times}")
+                                _confirm_path = confirm_path_template.format(
+                                    uid=uid or "",
+                                    captcha_id=captcha_params.get("captcha_id") or parsed.captcha_id,
+                                    lot_number=captcha_params["lot_number"],
+                                    pass_token=captcha_params["pass_token"],
+                                    gen_time=captcha_params["gen_time"],
+                                    captcha_output=captcha_params["captcha_output"],
+                                )
+                                _confirm_body = {
+                                    "activityId": int(_outer_activity_id) if _outer_activity_id else None,
+                                    "syntheticNum": max_times,
+                                    "syntheticId": int(synthetic_id),
+                                }
+                                print(f"[confirm] body={_confirm_body}")
+                                confirm_result = client.confirm_synthesis(_confirm_path, _confirm_body)
+                                entry["confirm"] = confirm_result
+                                if is_success(confirm_result):
+                                    confirmed = True
+                                    entry["code"] = 0
+                                else:
+                                    entry["code"] = (
+                                        confirm_result.get("code", 1)
+                                        if isinstance(confirm_result, dict)
+                                        else 1
+                                    )
+
                         round_entries.append(entry)
-                        if is_success(submit_result):
+                        actually_succeeded = (
+                            (parsed.captcha_mode == "skip" and is_success(submit_result))
+                            or confirmed
+                        )
+                        if actually_succeeded:
                             round_progress = True
                             successful_state_by_synthetic_id[str(synthetic_id)] = material_state_signature
                             successful_submits.append(
@@ -1364,6 +1514,7 @@ def main():
                                     "attempt_count": submit_outcome["attempt_count"],
                                     "submit_concurrency": submit_outcome["concurrency"],
                                     "submit": submit_result,
+                                    **({"confirm": entry["confirm"]} if "confirm" in entry else {}),
                                 }
                             )
 

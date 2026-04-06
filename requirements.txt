@@ -3,3 +3,12 @@ requests>=2.28
 PyYAML>=6.0
 # frida Python SDK 不再需要（通过 adb 文件交换与脚本通信）
 # 如需直接 Frida attach（非 iBox 场景）可加: frida>=16.0
+
+# ── GeeTest V4 自动过验证码（可选）────────────────────────────────────────────
+# synthesis-auto --captcha-mode=auto 需要以下依赖：
+#   conda activate ibox
+#   pip install playwright Pillow numpy
+#   playwright install chromium
+playwright>=1.40
+Pillow>=9.0
+numpy>=1.21
