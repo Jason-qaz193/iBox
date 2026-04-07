@@ -300,6 +300,12 @@ python run.py synthesis-auto 13800138000 - --dry-run
 python run.py synthesis-auto 13800138000 - --submit-window 60 --submit-concurrency 3 --retry-interval 0.3
 ```
 
+如果你只希望本次最多合成指定个数：
+
+```bash
+python run.py synthesis-auto 13800138000 - --target-count 3
+```
+
 注意：
 
 - 当前默认就是按活动列表接口返回的“当前活动”去扫，不额外暴露翻页参数
@@ -309,6 +315,7 @@ python run.py synthesis-auto 13800138000 - --submit-window 60 --submit-concurren
 - 单次提交失败后会在 `--submit-window` 指定的时间窗口内持续重试
 - `--retry-interval` 是这个窗口内两次尝试之间的短间隔，默认 0.3 秒
 - `--submit-concurrency` 可以让同一个合成项在窗口内用小并发持续抢，任一成功就会收敛停止
+- `--target-count` / `--expected-count` 可以限制本次最多提交的 `syntheticNum` 总数，不传则保持原来的“能合成多少就提交多少”
 - 当前命令只负责 `submit`，如果该活动后面还需要验证码确认，仍然继续用 `synthesis-confirm`
 
 ### 9. 查看公开求购详情

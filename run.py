@@ -166,6 +166,13 @@ def build_parser(config: dict | None = None) -> argparse.ArgumentParser:
         help="Maximum scan rounds; each round re-checks all recipes after successful synthesis",
     )
     synthesis_auto.add_argument(
+        "--target-count",
+        "--expected-count",
+        dest="target_count",
+        type=positive_int,
+        help="Expected total syntheticNum to submit in this run; defaults to all currently craftable items",
+    )
+    synthesis_auto.add_argument(
         "--submit-window",
         type=int,
         default=60,
@@ -375,6 +382,13 @@ def to_int(value) -> int | None:
         return int(str(value))
     except (TypeError, ValueError):
         return None
+
+
+def positive_int(value: str) -> int:
+    parsed = int(value)
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("must be a positive integer")
+    return parsed
 
 
 def normalize_material_item(item: dict) -> dict | None:
@@ -1378,10 +1392,15 @@ def main():
                 rounds = []
                 successful_submits = []
                 successful_state_by_synthetic_id = {}
+                remaining_target_count = parsed.target_count
                 for round_no in range(1, max(parsed.max_rounds, 1) + 1):
+                    if remaining_target_count is not None and remaining_target_count <= 0:
+                        break
                     round_entries = []
                     round_progress = False
                     for synthetic_id in synthetic_ids:
+                        if remaining_target_count is not None and remaining_target_count <= 0:
+                            break
                         center_path = render_command_path(
                             config,
                             "synthesis-center",
@@ -1415,14 +1434,22 @@ def main():
                         if server_cap is not None and server_cap < max_times:
                             max_times = server_cap
                         material_state_signature = build_material_state_signature(candidate)
-                        plan = summarize_synthesis_plan(candidate, max_times)
-                        entry["plan"] = plan
 
                         if max_times <= 0:
+                            entry["plan"] = summarize_synthesis_plan(candidate, max_times)
                             entry["code"] = 0
                             entry["message"] = "Current materials are insufficient for this recipe."
                             round_entries.append(entry)
                             continue
+
+                        available_times = max_times
+                        if remaining_target_count is not None:
+                            max_times = min(max_times, remaining_target_count)
+                        plan = summarize_synthesis_plan(candidate, max_times)
+                        plan["available_times_after_caps"] = available_times
+                        if remaining_target_count is not None:
+                            plan["target_count_remaining_before"] = remaining_target_count
+                        entry["plan"] = plan
 
                         previous_success_state = successful_state_by_synthetic_id.get(str(synthetic_id))
                         if previous_success_state == material_state_signature:
@@ -1441,6 +1468,8 @@ def main():
                             entry["code"] = 0
                             entry["submitted"] = False
                             round_entries.append(entry)
+                            if remaining_target_count is not None:
+                                remaining_target_count -= max_times
                             continue
 
                         submit_outcome = submit_synthesis_with_retry(
@@ -1505,6 +1534,8 @@ def main():
                         )
                         if actually_succeeded:
                             round_progress = True
+                            if remaining_target_count is not None:
+                                remaining_target_count -= max_times
                             successful_state_by_synthetic_id[str(synthetic_id)] = material_state_signature
                             successful_submits.append(
                                 {
@@ -1533,6 +1564,8 @@ def main():
                     "activity_details": activity_details,
                     "synthetic_ids": synthetic_ids,
                     "rounds": rounds,
+                    "target_count": parsed.target_count,
+                    "remaining_target_count": remaining_target_count,
                     "submitted_count": len(successful_submits),
                     "submitted": successful_submits,
                 }
