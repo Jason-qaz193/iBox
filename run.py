@@ -222,6 +222,18 @@ def build_parser(config: dict | None = None) -> argparse.ArgumentParser:
         action="store_true",
         help="Show the browser window when using Playwright captcha auto-solve",
     )
+    synthesis_auto.add_argument(
+        "--detail-interval",
+        type=float,
+        default=0.3,
+        help="Seconds to wait between each activity-detail request to avoid 429 (default: 0.3)",
+    )
+    synthesis_auto.add_argument(
+        "--pre-start-window",
+        type=float,
+        default=60.0,
+        help="Start polling this many seconds before the activity opens (default: 60)",
+    )
 
     synthesis_confirm = subparsers.add_parser("synthesis-confirm", help="Confirm synthesis with captcha params")
     add_auth_args(synthesis_confirm)
@@ -760,6 +772,94 @@ def extract_synthetic_ids(value) -> list[str]:
         seen.add(synthetic_id)
         deduped.append(synthetic_id)
     return deduped
+
+
+def find_earliest_upcoming_start_time(activity_details: list[dict]) -> datetime | None:
+    """Return the earliest future startTime found across all activity detail response nodes."""
+    now = datetime.now()
+    earliest: datetime | None = None
+    for item in activity_details:
+        detail = item.get("detail") if isinstance(item, dict) else item
+        for node in iter_nested_dicts(detail or {}):
+            start_time = parse_datetime_value(
+                first_present(node, ("startTime", "start_at", "beginTime"))
+            )
+            if start_time and start_time > now:
+                if earliest is None or start_time < earliest:
+                    earliest = start_time
+    return earliest
+
+
+def extract_upcoming_synthetic_ids_with_start(
+    activity_details: list[dict],
+) -> tuple[list[str], dict[str, str], datetime | None]:
+    """Extract syntheticActivityId values from channels that have not yet started
+    (but have not ended either), bypassing the is_channel_active start-time filter.
+
+    Returns (ids, synthetic_id_to_activity_id, earliest_start_time).
+    Used to pre-populate IDs during the pre-start wait so no re-fetch is needed.
+    """
+    now = datetime.now()
+    ids: list[str] = []
+    id_to_activity: dict[str, str] = {}
+    earliest_start: datetime | None = None
+    for item in activity_details:
+        if not isinstance(item, dict):
+            continue
+        activity_id = str(item.get("activity_id", ""))
+        detail = item.get("detail")
+        if not is_success(detail):
+            continue
+        for node in iter_nested_dicts(detail):
+            if "syntheticActivityId" not in node:
+                continue
+            sid = first_present(node, ("syntheticActivityId", "synthetic_activity_id"))
+            if sid in (None, ""):
+                continue
+            end_time = parse_datetime_value(first_present(node, ("endTime", "end_at", "finishTime")))
+            if end_time and now > end_time:
+                continue  # already ended, skip
+            start_time = parse_datetime_value(first_present(node, ("startTime", "start_at", "beginTime")))
+            ids.append(str(sid))
+            if activity_id:
+                id_to_activity.setdefault(str(sid), activity_id)
+            if start_time and start_time > now:
+                if earliest_start is None or start_time < earliest_start:
+                    earliest_start = start_time
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for sid in ids:
+        if sid not in seen:
+            seen.add(sid)
+            deduped.append(sid)
+    return deduped, id_to_activity, earliest_start
+
+
+def _wait_until_start(target: datetime):
+    """Sleep with periodic countdown prints until target datetime is reached.
+
+    Accuracy tiers:
+      > 60s  : sleep 30s between checks
+      10–60s : sleep 5s between checks, print every tick
+      1–10s  : sleep 0.5s between checks, print every tick
+      < 1s   : tight 20ms spin loop, no print (minimises OS scheduling jitter)
+    """
+    while True:
+        remaining = (target - datetime.now()).total_seconds()
+        if remaining <= 0:
+            break
+        if remaining < 1.0:
+            # Tight spin: 20 ms granularity → ≤20 ms overshoot
+            time.sleep(0.02)
+        elif remaining <= 10:
+            print(f"[wait] {remaining:.1f}s remaining…", flush=True)
+            time.sleep(0.5)
+        elif remaining <= 60:
+            print(f"[wait] {remaining:.0f}s remaining…", flush=True)
+            time.sleep(5.0)
+        else:
+            print(f"[wait] {remaining:.0f}s remaining…", flush=True)
+            time.sleep(min(remaining - 5, 30.0))
 
 
 def build_parallel_submit_client(client):
@@ -1362,7 +1462,9 @@ def main():
                 activity_details = []
                 synthetic_ids = []
                 synthetic_id_to_activity_id: dict[str, str] = {}
-                for activity_id in activity_ids:
+                for idx, activity_id in enumerate(activity_ids):
+                    if idx > 0 and parsed.detail_interval > 0:
+                        time.sleep(parsed.detail_interval)
                     detail_path = render_command_path(
                         config,
                         "synthesis-activity-detail",
@@ -1370,6 +1472,14 @@ def main():
                         activity_id=activity_id,
                     )
                     detail_result = client.get_synthesis_activity_detail(detail_path)
+                    # 429: back off and retry once
+                    if isinstance(detail_result, dict) and str(detail_result.get("code", "")) == "429" or (
+                        isinstance(detail_result, dict) and "429" in str(detail_result.get("_raw", ""))[:50]
+                    ):
+                        backoff = max(parsed.detail_interval * 3, 1.0)
+                        print(f"[detail] 429 on activity {activity_id}, backing off {backoff:.1f}s…", flush=True)
+                        time.sleep(backoff)
+                        detail_result = client.get_synthesis_activity_detail(detail_path)
                     activity_details.append({"activity_id": activity_id, "detail": detail_result})
                     if is_success(detail_result):
                         new_ids = extract_synthetic_ids(detail_result)
@@ -1378,6 +1488,24 @@ def main():
                         synthetic_ids.extend(new_ids)
 
                 synthetic_ids = list(dict.fromkeys(synthetic_ids))
+                if not synthetic_ids:
+                    # Pre-fetch: extract upcoming channel IDs from already-fetched details
+                    # (bypasses the is_channel_active start-time filter in extract_synthetic_ids)
+                    pre_ids, pre_id_map, pre_start = extract_upcoming_synthetic_ids_with_start(activity_details)
+                    if pre_ids:
+                        now_dt = datetime.now()
+                        seconds_until = (pre_start - now_dt).total_seconds() if pre_start else 0
+                        if pre_start and 0 < seconds_until <= parsed.pre_start_window:
+                            print(
+                                f"[wait] Pre-fetched {len(pre_ids)} synthetic ID(s): {pre_ids}; "
+                                f"activity opens at {pre_start.strftime('%H:%M:%S')} "
+                                f"({seconds_until:.0f}s away) — waiting (no re-fetch needed)…"
+                            )
+                            _wait_until_start(pre_start)
+                            print("[wait] Activity start time reached, proceeding with pre-fetched IDs…")
+                        synthetic_ids = pre_ids
+                        for sid, aid in pre_id_map.items():
+                            synthetic_id_to_activity_id.setdefault(sid, aid)
                 if not synthetic_ids:
                     return {
                         "code": 1,
@@ -1388,6 +1516,19 @@ def main():
                             "Inspect result.activity_details and adjust parser aliases if needed."
                         ),
                     }
+
+                # Wait until the activity opens (single one-time sleep before round loop)
+                earliest_start = find_earliest_upcoming_start_time(activity_details)
+                if earliest_start is not None:
+                    now = datetime.now()
+                    seconds_until = (earliest_start - now).total_seconds()
+                    if 0 < seconds_until <= parsed.pre_start_window:
+                        print(
+                            f"[wait] Activity opens at {earliest_start.strftime('%H:%M:%S')} "
+                            f"({seconds_until:.0f}s away) — waiting to start synthesis attempts…"
+                        )
+                        _wait_until_start(earliest_start)
+                        print("[wait] Activity start time reached, beginning synthesis attempts…")
 
                 rounds = []
                 successful_submits = []
