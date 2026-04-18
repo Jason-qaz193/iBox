@@ -11,12 +11,13 @@ Modes:
 """
 
 import argparse
-from datetime import datetime
+from datetime import datetime, timedelta
 import json
 import os
 import sys
 import threading
 import time
+import uuid
 from typing import TextIO
 
 import yaml
@@ -198,7 +199,7 @@ def build_parser(config: dict | None = None) -> argparse.ArgumentParser:
     synthesis_auto.add_argument(
         "--captcha-mode",
         choices=["auto", "manual", "skip"],
-        default="manual",
+        default="auto",
         help=(
             "How to handle the GeeTest V4 captcha that submit triggers: "
             "auto=try Playwright first then fall back to manual, "
@@ -227,6 +228,12 @@ def build_parser(config: dict | None = None) -> argparse.ArgumentParser:
         type=float,
         default=0.3,
         help="Seconds to wait between each activity-detail request to avoid 429 (default: 0.3)",
+    )
+    synthesis_auto.add_argument(
+        "--pre-center-offset",
+        type=float,
+        default=3.0,
+        help="Seconds before activity start to pre-call synthesis-center and cache the payload (default: 3)",
     )
     synthesis_auto.add_argument(
         "--pre-start-window",
@@ -265,11 +272,42 @@ def build_parser(config: dict | None = None) -> argparse.ArgumentParser:
     add_auth_args(wanted_detail)
     wanted_detail.add_argument("purchase_order_id")
 
-    wanted_deal = subparsers.add_parser("wanted-deal", help="Deal a wanted/purchase order relation")
+    wanted_deal = subparsers.add_parser(
+        "wanted-deal",
+        help=(
+            "Deal a wanted/purchase order relation. "
+            "Pass purchase_order_id+relation_id directly, or use --collection-name to look them up automatically."
+        ),
+    )
     add_auth_args(wanted_deal)
-    wanted_deal.add_argument("purchase_order_id")
-    wanted_deal.add_argument("relation_id")
-    add_payload_arg(wanted_deal)
+    wanted_deal.add_argument("purchase_order_id", nargs="?", default=None, help="Purchase order ID (optional when --collection-name is used)")
+    wanted_deal.add_argument("relation_id", nargs="?", default=None, help="Relation ID (optional when --collection-name is used)")
+    wanted_deal.add_argument("--collection-name", dest="collection_name", default="", help="藏品名称 — auto-lookup purchase_order_id and relation_id by name")
+    wanted_deal.add_argument("--group-id", dest="group_id", default="", help="藏品分组ID — query purchase orders directly, bypassing name lookup")
+    wanted_deal.add_argument("--quantity", dest="quantity", type=int, default=1, help="出售数量 (default: 1)")
+    wanted_deal.add_argument("--min-price", dest="min_price", type=float, default=0.0, help="最低出售价 — only match purchase orders at or above this price")
+    wanted_deal.add_argument("--consignment-password", dest="consignment_password", default="", help="寄售密码 — included in the deal request body")
+    wanted_deal.add_argument("--collection-id", dest="collection_id", default="", help="要卖出的具体藏品ID — auto-selects an unlocked item when omitted")
+    wanted_deal.add_argument("--payment-platform", dest="payment_platform", type=int, default=30, help="支付钱包平台代码 (default: 30)")
+    wanted_deal.add_argument("--po-page-size", dest="po_page_size", type=int, default=20, help="Page size when listing purchase orders for name lookup (default: 20)")
+    wanted_deal.add_argument("--market-search-pages", dest="market_search_pages", type=int, default=10, help="How many public market pages to scan by collection name (default: 10)")
+    wanted_deal.add_argument("--market-segment-id", dest="market_segment_id", default="-1", help="Public market segmentId to search (default: -1)")
+    wanted_deal.add_argument("--dry-run", action="store_true", help="Print matched orders without executing the deal (only in name-lookup mode)")
+    add_payload_arg(wanted_deal, required=False)
+
+    wanted_buy = subparsers.add_parser(
+        "wanted-buy",
+        help="Place a buy/wanted order (求购单). Use --group-id+--price, or --collection-name+--price to look up group-id automatically.",
+    )
+    add_auth_args(wanted_buy)
+    wanted_buy.add_argument("--group-id", dest="group_id", default="", help="藏品分组ID (skip if using --collection-name)")
+    wanted_buy.add_argument("--collection-name", dest="collection_name", default="", help="藏品名称 — auto-lookup group_id by name")
+    wanted_buy.add_argument("--price", dest="price", type=float, required=True, help="出价（元）")
+    wanted_buy.add_argument("--quantity", dest="quantity", type=int, default=1, help="求购数量 (default: 1)")
+    wanted_buy.add_argument("--payment-platform", dest="payment_platform", type=int, default=25, help="支付平台代码 (default: 25)")
+    wanted_buy.add_argument("--consignment-password", dest="consignment_password", default="", help="寄售密码")
+    wanted_buy.add_argument("--dry-run", action="store_true", help="Print resolved group_id without placing order")
+    add_payload_arg(wanted_buy, required=False)
 
     api_parser = subparsers.add_parser("api", help="Call an arbitrary authenticated iBox API path in RPC mode")
     add_auth_args(api_parser)
@@ -387,6 +425,24 @@ def first_present(mapping: dict | None, keys: tuple[str, ...]):
     return None
 
 
+def extract_list_payload(result: dict | None) -> list:
+    if not isinstance(result, dict):
+        return []
+    data = result.get("data")
+    if isinstance(data, list):
+        return data
+    if isinstance(data, dict):
+        for key in ("list", "records", "items", "data", "rows", "result"):
+            value = data.get(key)
+            if isinstance(value, list):
+                return value
+            if isinstance(value, dict):
+                nested = extract_list_payload({"data": value})
+                if nested:
+                    return nested
+    return []
+
+
 def to_int(value) -> int | None:
     if isinstance(value, bool) or value in (None, ""):
         return None
@@ -394,6 +450,70 @@ def to_int(value) -> int | None:
         return int(str(value))
     except (TypeError, ValueError):
         return None
+
+
+def to_price_fen(value) -> int | None:
+    if isinstance(value, bool) or value in (None, ""):
+        return None
+    if isinstance(value, float):
+        return int(round(value * 100))
+    text = str(value).strip()
+    if not text:
+        return None
+    try:
+        if "." in text:
+            return int(round(float(text) * 100))
+        return int(text)
+    except (TypeError, ValueError):
+        return None
+
+
+def format_price_yuan(price_fen: int | None) -> str:
+    if price_fen is None:
+        return "unknown"
+    return f"{price_fen / 100:.2f}"
+
+
+def build_webview_api_headers(
+    token: str | None,
+    *,
+    origin: str = "https://detail-page.ibox.art",
+    app_version: str = "2.3.2",
+) -> dict:
+    origin = origin.rstrip("/")
+    cookies = [
+        f"version={app_version}",
+        "deviceId=",
+        "stage=",
+    ]
+    if token:
+        cookies.insert(0, f"token={token}")
+    headers = {
+        "Content-Type": None,
+        "Accept": "application/json, text/plain, */*",
+        "User-Agent": (
+            "Mozilla/5.0 (Linux; Android 12; M2006J10C Build/SP1A.210812.016; wv) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/89.0.4389.72 "
+            "MQQBrowser/6.2 TBS/046295 Mobile Safari/537.36 ibox_app ;kyc/h5face;kyc/2.0 "
+            f"iBoxWebView iboxVersion={app_version};"
+        ),
+        "msg-id": uuid.uuid4().hex,
+        "platform-type": "1",
+        "app-version": app_version,
+        "device-id": "",
+        "allowouttest": "1",
+        "Origin": origin,
+        "Referer": f"{origin}/",
+        "X-Requested-With": "com.box.art",
+        "Sec-Fetch-Site": "same-site",
+        "Sec-Fetch-Mode": "cors",
+        "Sec-Fetch-Dest": "empty",
+        "Accept-Language": "zh-CN,zh;q=0.9,en-US;q=0.8,en;q=0.7",
+        "Cookie": "; ".join(cookies),
+    }
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    return headers
 
 
 def positive_int(value: str) -> int:
@@ -1011,12 +1131,34 @@ def is_auth_failure(result: dict | None) -> bool:
     return any(keyword in message for keyword in auth_keywords)
 
 
+def uid_from_jwt(token: str) -> str | None:
+    """Decode the JWT payload (no signature verification) and extract userId."""
+    try:
+        import base64 as _b64
+        parts = token.split(".")
+        if len(parts) < 2:
+            return None
+        padded = parts[1] + "=" * (4 - len(parts[1]) % 4)
+        payload = json.loads(_b64.urlsafe_b64decode(padded))
+        for key in ("userId", "uid"):
+            val = payload.get(key)
+            if val not in (None, "") and str(val).lstrip("-").isdigit():
+                return str(val)
+    except Exception:
+        pass
+    return None
+
+
 def extract_uid(login_result: dict) -> str | None:
     data = (login_result or {}).get("data") or {}
     for key in ("uid", "userId", "id"):
         value = data.get(key)
         if value not in (None, ""):
             return str(value)
+    # Fallback: decode from the JWT token if present
+    token = data.get("token")
+    if token:
+        return uid_from_jwt(str(token))
     return None
 
 
@@ -1181,6 +1323,7 @@ def main():
     login_path = config["login"]["path"]
     sms_path = config.get("sms", {}).get("path", "/personal-center-service/login/sendSms")
     headers = config.get("headers") or {}
+    app_version = str(headers.get("app-version") or headers.get("App-Version") or "2.3.2")
     config_c_id = config.get("login", {}).get("c_id", "")
     cmd = parsed.command
 
@@ -1249,6 +1392,7 @@ def main():
         "purchase-detail",
         "wanted-detail",
         "wanted-deal",
+        "wanted-buy",
         "api",
     }
     if cmd in rpc_only_commands:
@@ -1276,6 +1420,11 @@ def main():
             sys.exit(1)
 
         uid = parsed.uid or extract_uid(login_result) or ((saved_session or {}).get("uid") if saved_session else None)
+        # Last resort: decode uid from the JWT token stored in session
+        if not uid:
+            _jwt_token = ((saved_session or {}).get("token") or extract_token(login_result))
+            if _jwt_token:
+                uid = uid_from_jwt(str(_jwt_token))
         operation = None
 
         if cmd == "market-info":
@@ -1324,7 +1473,14 @@ def main():
                 page_size=parsed.page_size,
                 uid=uid,
             )
-            operation = lambda: client.get(path)
+            operation = lambda: client.get(
+                path,
+                headers=build_webview_api_headers(
+                    getattr(client, "token", None) or ((saved_session or {}).get("token") if saved_session else None),
+                    origin="https://detail-page.ibox.art",
+                    app_version=app_version,
+                ),
+            )
         elif cmd == "synthesis-activity-list":
             path = render_command_path(
                 config,
@@ -1501,11 +1657,33 @@ def main():
                                 f"activity opens at {pre_start.strftime('%H:%M:%S')} "
                                 f"({seconds_until:.0f}s away) — waiting (no re-fetch needed)…"
                             )
-                            _wait_until_start(pre_start)
-                            print("[wait] Activity start time reached, proceeding with pre-fetched IDs…")
+                            wait_target = pre_start
+                        else:
+                            wait_target = None
                         synthetic_ids = pre_ids
                         for sid, aid in pre_id_map.items():
                             synthetic_id_to_activity_id.setdefault(sid, aid)
+                    else:
+                        wait_target = None
+                else:
+                    # synthetic_ids already known — but also check for upcoming channels
+                    # that will start soon (e.g. a 抖合 window about to open).  If any
+                    # not-yet-active channels fall within pre_start_window, wait for those
+                    # and synthesize them instead of the currently-active ones.
+                    pre_ids, pre_id_map, _es = extract_upcoming_synthetic_ids_with_start(activity_details)
+                    active_set = set(synthetic_ids)
+                    upcoming_ids = [sid for sid in pre_ids if sid not in active_set]
+                    if upcoming_ids and _es is not None and 0 < (_es - datetime.now()).total_seconds() <= parsed.pre_start_window:
+                        wait_target = _es
+                        synthetic_ids = upcoming_ids
+                        for sid, aid in pre_id_map.items():
+                            if sid in set(upcoming_ids):
+                                synthetic_id_to_activity_id.setdefault(sid, aid)
+                    elif _es is not None and 0 < (_es - datetime.now()).total_seconds() <= parsed.pre_start_window:
+                        wait_target = _es
+                    else:
+                        wait_target = None
+
                 if not synthetic_ids:
                     return {
                         "code": 1,
@@ -1517,18 +1695,42 @@ def main():
                         ),
                     }
 
-                # Wait until the activity opens (single one-time sleep before round loop)
-                earliest_start = find_earliest_upcoming_start_time(activity_details)
-                if earliest_start is not None:
-                    now = datetime.now()
-                    seconds_until = (earliest_start - now).total_seconds()
-                    if 0 < seconds_until <= parsed.pre_start_window:
-                        print(
-                            f"[wait] Activity opens at {earliest_start.strftime('%H:%M:%S')} "
-                            f"({seconds_until:.0f}s away) — waiting to start synthesis attempts…"
+                # Pre-call synthesis-center during the wait so round 1 can skip it
+                pre_center_cache: dict[str, dict] = {}
+                if wait_target is not None:
+                    seconds_until = (wait_target - datetime.now()).total_seconds()
+                    print(
+                        f"[wait] Activity opens at {wait_target.strftime('%H:%M:%S')} "
+                        f"({seconds_until:.0f}s away) — will pre-fetch synthesis-center "
+                        f"{parsed.pre_center_offset:.0f}s before start…"
+                    )
+                    # Sleep until pre_center_offset seconds before start
+                    pre_call_time = wait_target - timedelta(seconds=max(parsed.pre_center_offset, 0))
+                    if pre_call_time > datetime.now():
+                        _wait_until_start(pre_call_time)
+                    # Pre-call synthesis-center for each id
+                    for _sid in synthetic_ids:
+                        _center_path = render_command_path(
+                            config,
+                            "synthesis-center",
+                            "/synthesis-service/synthetic/center/{synthetic_id}",
+                            synthetic_id=_sid,
                         )
-                        _wait_until_start(earliest_start)
-                        print("[wait] Activity start time reached, beginning synthesis attempts…")
+                        _center_result = client.get_synthesis_center(_center_path)
+                        if is_success(_center_result):
+                            pre_center_cache[str(_sid)] = _center_result
+                            _cdata = (_center_result.get("data") or {})
+                            _surplus = to_int(first_present(_cdata, ("surplusNum", "remainNum", "leftNum")))
+                            print(
+                                f"[pre-center] {_sid} cached ✔"
+                                + (f"  surplusNum={_surplus}" if _surplus is not None else ""),
+                                flush=True,
+                            )
+                        else:
+                            print(f"[pre-center] {_sid} failed ({_center_result.get('code')}), will fetch live", flush=True)
+                    # Tight spin for remaining time
+                    _wait_until_start(wait_target)
+                    print("[wait] Activity start time reached, beginning synthesis attempts…")
 
                 rounds = []
                 successful_submits = []
@@ -1548,7 +1750,11 @@ def main():
                             "/synthesis-service/synthetic/center/{synthetic_id}",
                             synthetic_id=synthetic_id,
                         )
-                        center_result = client.get_synthesis_center(center_path)
+                        center_result = pre_center_cache.pop(str(synthetic_id), None)
+                        if center_result is not None:
+                            print(f"[round {round_no}] using pre-fetched center for synthetic_id={synthetic_id}", flush=True)
+                        else:
+                            center_result = client.get_synthesis_center(center_path)
                         entry = {
                             "synthetic_id": synthetic_id,
                             "center": center_result,
@@ -1774,18 +1980,308 @@ def main():
             )
             operation = lambda: client.get(path)
         elif cmd == "wanted-deal":
-            if not uid:
-                raise SystemExit("Error: uid is required for wanted-deal. Pass --uid or ensure login response contains uid")
-            payload = parse_payload_arg(parsed.payload)
-            path = render_command_path(
-                config,
-                "wanted-deal",
-                "/order-create-service/advance-orders/{purchase_order_id}/relation/{relation_id}/deal?uid={uid}",
-                purchase_order_id=parsed.purchase_order_id,
-                relation_id=parsed.relation_id,
-                uid=uid,
-            )
-            operation = lambda: client.post(path, payload)
+            _uid = uid or ""
+            collection_name = (parsed.collection_name or "").strip()
+            group_id_override = (parsed.group_id or "").strip()
+            if collection_name or group_id_override:
+                target_qty = parsed.quantity
+                target_min_price_yuan = parsed.min_price
+                target_min_price_fen = int(round(target_min_price_yuan * 100))
+                consignment_password = parsed.consignment_password or ""
+                collection_id_override = (parsed.collection_id or "").strip()
+                payment_platform = parsed.payment_platform
+                po_page_size = parsed.po_page_size
+                market_search_pages = max(1, int(parsed.market_search_pages or 1))
+                market_segment_id = str(parsed.market_segment_id or "-1")
+                dry_run = parsed.dry_run
+
+                def wanted_deal_by_name_operation():
+                    auth_token = getattr(client, "token", None) or ((saved_session or {}).get("token") if saved_session else None)
+                    webview_headers = build_webview_api_headers(
+                        auth_token,
+                        origin="https://detail-page.ibox.art",
+                        app_version=app_version,
+                    )
+                    warmed_groups = set()
+                    auth_failure_result = None
+
+                    def group_from_market_item(item: dict, source: str) -> dict | None:
+                        name = first_present(item, ("name", "groupName", "collectionName", "title"))
+                        if not name or (collection_name and collection_name not in str(name)):
+                            return None
+                        gid = first_present(item, ("id", "groupId", "collectionGroupId", "digitalCollectionGroupId"))
+                        if gid in (None, ""):
+                            return None
+                        return {"group_id": str(gid), "name": str(name), "source": source}
+
+                    def find_market_groups() -> list[dict]:
+                        if group_id_override:
+                            return [{"group_id": group_id_override, "name": collection_name or f"group-{group_id_override}", "source": "cli"}]
+                        seen = set()
+                        groups = []
+                        for page_no in range(1, market_search_pages + 1):
+                            path = (
+                                "/public-service/markets"
+                                f"?sortType=0&pageNo={page_no}&segmentId={market_segment_id}"
+                                "&sortField=2&pageSize=50&timeRange=0"
+                            )
+                            result = client.get(path)
+                            if not is_success(result):
+                                print(f"[wanted-deal] market page {page_no} failed: code={result.get('code')}", flush=True)
+                                continue
+                            page_items = extract_list_payload(result)
+                            for item in page_items:
+                                if not isinstance(item, dict):
+                                    continue
+                                group = group_from_market_item(item, path)
+                                if group and group["group_id"] not in seen:
+                                    seen.add(group["group_id"])
+                                    groups.append(group)
+                            if groups:
+                                break
+                            if isinstance(result.get("data"), dict) and result["data"].get("hasMore") is False:
+                                break
+                        return groups
+
+                    def warm_market_context(group_id: str) -> None:
+                        nonlocal auth_failure_result
+                        if group_id in warmed_groups:
+                            return
+                        warmed_groups.add(group_id)
+                        path = (
+                            f"/public-market-service/digital-collection-groups/{group_id}"
+                            "/purchase-consignment-info?configType=0"
+                        )
+                        result = client.get(path)
+                        if is_auth_failure(result):
+                            auth_failure_result = result
+                            return
+                        if not is_success(result):
+                            print(f"[wanted-deal] market context warmup failed for group {group_id}: code={result.get('code')}", flush=True)
+
+                    def list_purchase_orders(group_id: str) -> list[dict]:
+                        nonlocal auth_failure_result
+                        warm_market_context(group_id)
+                        if auth_failure_result:
+                            return []
+                        path = (
+                            f"/public-market-service/digital-collection-groups/{group_id}"
+                            f"/purchase-orders?pageNo=1&pageSize={po_page_size}&uid={_uid}"
+                        )
+                        result = client.get(path, headers=webview_headers)
+                        if is_auth_failure(result):
+                            auth_failure_result = result
+                            return []
+                        if not is_success(result):
+                            print(f"[wanted-deal] purchase-orders failed for group {group_id}: code={result.get('code')}", flush=True)
+                            return []
+                        return extract_list_payload(result)
+
+                    def candidate_from_order(group: dict, order: dict) -> dict | None:
+                        po_id = first_present(order, ("id", "purchaseOrderId", "purchaseConsignmentOrderId", "purchaseOrderNo", "advanceOrderId"))
+                        relation_id = first_present(order, ("orderRelationId", "relationId", "relation_id"))
+                        if po_id in (None, "") or relation_id in (None, ""):
+                            return None
+                        price_fen = to_price_fen(first_present(order, ("price", "unitPrice", "salePrice")))
+                        if target_min_price_fen > 0 and price_fen is not None and price_fen < target_min_price_fen:
+                            return None
+                        return {
+                            "group_id": group["group_id"],
+                            "group_name": group["name"],
+                            "purchase_order_id": str(po_id),
+                            "relation_id": str(relation_id),
+                            "price_fen": price_fen,
+                            "price_yuan": None if price_fen is None else price_fen / 100,
+                            "payment_platform": first_present(order, ("paymentPlatformCode", "paymentPlatform")) or payment_platform,
+                        }
+
+                    def pick_owned_collection_id(group_id: str) -> str | None:
+                        if collection_id_override:
+                            return collection_id_override
+                        path = (
+                            f"/personal-center-service/users/digital-collection-groups/{group_id}"
+                            "?pageSize=20&pageNo=1&lockStatus=0"
+                        )
+                        result = client.get(path)
+                        if not is_success(result):
+                            print(f"[wanted-deal] owned collections failed for group {group_id}: code={result.get('code')}", flush=True)
+                            return None
+                        for item in extract_list_payload(result):
+                            if not isinstance(item, dict):
+                                continue
+                            cid = first_present(item, ("id", "digitalCollectionId", "collectionId", "digitalCollectionID", "collectionID"))
+                            if cid not in (None, ""):
+                                return str(cid)
+                        return None
+
+                    matched_groups = find_market_groups()
+                    if not matched_groups:
+                        return {"code": 1, "error": f"No public market group found matching name: {collection_name!r}"}
+
+                    print(f"[wanted-deal] matched group(s): " + ", ".join(f"{g['name']}({g['group_id']})" for g in matched_groups), flush=True)
+
+                    candidates = []
+                    for group in matched_groups:
+                        orders = list_purchase_orders(group["group_id"])
+                        if auth_failure_result:
+                            return auth_failure_result
+                        print(f"[wanted-deal] {len(orders)} purchase order(s) in group {group['group_id']}", flush=True)
+                        for order in orders:
+                            if not isinstance(order, dict):
+                                continue
+                            candidate = candidate_from_order(group, order)
+                            if candidate:
+                                candidates.append(candidate)
+
+                    if not candidates:
+                        return {
+                            "code": 1,
+                            "error": f"No buy orders found for name={collection_name!r} with price >= {target_min_price_yuan}.",
+                            "matched_groups": matched_groups,
+                        }
+
+                    candidates.sort(key=lambda c: (c["price_fen"] or 0), reverse=True)
+                    print(f"[wanted-deal] {len(candidates)} candidate(s):", flush=True)
+                    for candidate in candidates[: min(len(candidates), 5)]:
+                        print(
+                            f"  purchase_order_id={candidate['purchase_order_id']} "
+                            f"relation_id={candidate['relation_id']} "
+                            f"price={format_price_yuan(candidate['price_fen'])}",
+                            flush=True,
+                        )
+
+                    if dry_run:
+                        return {"code": 0, "dry_run": True, "matched_groups": matched_groups, "candidates": candidates}
+
+                    if not consignment_password:
+                        return {"code": 1, "error": "wanted-deal requires --consignment-password"}
+
+                    owned_collection_cache = {}
+                    deal_results = []
+                    last_code = 1
+                    for candidate in candidates[:target_qty]:
+                        group_id = candidate["group_id"]
+                        if group_id not in owned_collection_cache:
+                            owned_collection_cache[group_id] = pick_owned_collection_id(group_id)
+                        collection_id = owned_collection_cache[group_id]
+                        if not collection_id:
+                            return {"code": 1, "error": "Could not select an unlocked owned collection. Pass --collection-id explicitly."}
+
+                        deal_path = render_command_path(
+                            config,
+                            "wanted-deal",
+                            "/order-create-service/advance-orders/{purchase_order_id}/relation/{relation_id}/deal?uid={uid}",
+                            purchase_order_id=candidate["purchase_order_id"],
+                            relation_id=candidate["relation_id"],
+                            uid=_uid,
+                        )
+                        deal_payload = {
+                            "paymentPlatformCode": int(candidate["payment_platform"]),
+                            "digitalCollectionId": int(collection_id),
+                            "consignmentPassword": consignment_password,
+                            "password": consignment_password,
+                            "consignPassword": consignment_password,
+                            "consignmentPassWord": consignment_password,
+                        }
+                        print(
+                            f"[wanted-deal] dealing purchase_order_id={candidate['purchase_order_id']} "
+                            f"relation_id={candidate['relation_id']} collection_id={collection_id}",
+                            flush=True,
+                        )
+                        deal_result = client.post(deal_path, deal_payload)
+                        last_code = deal_result.get("code", 0 if is_success(deal_result) else 1)
+                        deal_results.append({
+                            "purchase_order_id": candidate["purchase_order_id"],
+                            "relation_id": candidate["relation_id"],
+                            "collection_id": collection_id,
+                            "payment_platform": candidate["payment_platform"],
+                            "group_name": candidate["group_name"],
+                            "price_fen": candidate["price_fen"],
+                            "price_yuan": candidate["price_yuan"],
+                            "deal": deal_result,
+                        })
+
+                    return {"code": last_code, "deal_results": deal_results, "matched_groups": matched_groups}
+
+                operation = wanted_deal_by_name_operation
+            else:
+                # ── direct ID mode ────────────────────────────────────────────
+                if not parsed.purchase_order_id or not parsed.relation_id:
+                    raise SystemExit(
+                        "Error: wanted-deal requires either --collection-name or both positional "
+                        "arguments purchase_order_id and relation_id"
+                    )
+                extra_payload = parse_payload_arg(parsed.payload)
+                deal_payload = {}
+                if parsed.consignment_password:
+                    deal_payload["consignmentPassword"] = parsed.consignment_password
+                    deal_payload["password"] = parsed.consignment_password
+                    deal_payload["consignPassword"] = parsed.consignment_password
+                    deal_payload["consignmentPassWord"] = parsed.consignment_password
+                if extra_payload:
+                    deal_payload.update(extra_payload)
+                path = render_command_path(
+                    config,
+                    "wanted-deal",
+                    "/order-create-service/advance-orders/{purchase_order_id}/relation/{relation_id}/deal?uid={uid}",
+                    purchase_order_id=parsed.purchase_order_id,
+                    relation_id=parsed.relation_id,
+                    uid=_uid,
+                )
+                operation = lambda: client.post(path, deal_payload)
+        elif cmd == "wanted-buy":
+            collection_name = (parsed.collection_name or "").strip()
+            group_id = (parsed.group_id or "").strip()
+            price_yuan = parsed.price          # user passes yuan, e.g. 4.5
+            price_fen = int(round(price_yuan * 100))  # API uses 分 (cents)
+            quantity = parsed.quantity
+            payment_platform = parsed.payment_platform
+            consignment_password = parsed.consignment_password or ""
+            dry_run = parsed.dry_run
+            extra_payload = parse_payload_arg(parsed.payload) or {}
+
+            # Resolve group_id from name if not provided
+            if not group_id and collection_name:
+                groups_result = client.get(
+                    "/personal-center-service/users/digital-collection-groups"
+                    "?groupType=0&isMetaVerse=0&pageNo=1&pageSize=100"
+                )
+                print(f"[wanted-buy] groups result: {json.dumps(groups_result, ensure_ascii=False)[:400]}", flush=True)
+                if not is_success(groups_result):
+                    raise SystemExit(f"Error: failed to fetch collection groups: {groups_result.get('code')}")
+                groups_data = (groups_result.get("data") or {})
+                groups_list = groups_data if isinstance(groups_data, list) else (
+                    groups_data.get("list") or groups_data.get("records") or groups_data.get("data") or []
+                )
+                matched = [g for g in groups_list if isinstance(g, dict) and collection_name in (g.get("name") or "")]
+                if not matched:
+                    raise SystemExit(f"Error: no collection group matching {collection_name!r}")
+                group_id = str(first_present(matched[0], ("id", "groupId")))
+                print(f"[wanted-buy] resolved group_id={group_id} name={matched[0].get('name')!r}")
+            elif not group_id:
+                raise SystemExit("Error: wanted-buy requires --group-id or --collection-name")
+
+            if dry_run:
+                def wanted_buy_op():
+                    return {"code": 0, "dry_run": True, "group_id": group_id, "price_fen": price_fen, "quantity": quantity}
+                operation = wanted_buy_op
+            else:
+                buy_payload = {
+                    "groupId": int(group_id),
+                    "price": price_fen,
+                    "quantity": quantity,
+                    "paymentPlatformCode": payment_platform,
+                }
+                if consignment_password:
+                    buy_payload["consignmentPassword"] = consignment_password
+                    buy_payload["password"] = consignment_password
+                buy_payload.update(extra_payload)
+                buy_path = render_command_path(
+                    config,
+                    "wanted-buy",
+                    "/order-create-service/advance-orders",
+                )
+                operation = lambda: client.post(buy_path, buy_payload)
         elif cmd == "api":
             payload = parse_payload_arg(parsed.payload)
             operation = (

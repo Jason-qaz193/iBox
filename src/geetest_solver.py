@@ -152,8 +152,10 @@ def find_gap_x_from_screenshot(bg_bytes: bytes) -> int:
     # Smooth over a narrow window for sub-pixel precision
     shadow_smooth = np.convolve(shadow_score, np.ones(7) / 7, mode="same")
 
-    # Ignore leftmost 15 % (slider start zone) and rightmost 8 % (edge noise)
-    skip_l = max(1, W // 7)
+    # Ignore leftmost 25 % — the slider piece spans ~15 % from the left; the
+    # extra margin prevents its dark shadow from being mistaken for the gap.
+    # Ignore rightmost 8 % (edge noise).
+    skip_l = max(1, W // 4)
     skip_r = max(1, W // 12)
     shadow_smooth[:skip_l] = 0
     shadow_smooth[-skip_r:] = 0
@@ -262,20 +264,27 @@ async def _solve_async(
 
         import json as _json_mod
 
-        async def _on_response(response) -> None:
+        # Route-based interception is far more reliable than page.on("response"):
+        # we are in the middleware chain so the response body is always readable,
+        # whereas the "response" event fires after the browser has already
+        # consumed the stream and response.text() silently returns nothing.
+        async def _intercept_gt_load(route) -> None:
             try:
-                url = response.url
-                if "/load" not in url:
-                    return
-                if not any(s in url for s in ("geetest.com", "gcaptcha", "gt.com")):
-                    return
-                text = await response.text()
-                js = _json_mod.loads(text)
-                _extract_gt_images(js, _gt_data)
+                response = await route.fetch()
+                try:
+                    body_bytes = await response.body()
+                    js = _json_mod.loads(body_bytes.decode("utf-8", errors="replace"))
+                    _extract_gt_images(js, _gt_data)
+                except Exception:
+                    pass
+                await route.fulfill(response=response)
             except Exception:
-                pass
+                await route.continue_()
 
-        page.on("response", _on_response)
+        await page.route(
+            lambda url: "geetest.com" in url and "/load" in url,
+            _intercept_gt_load,
+        )
 
         print("[geetest] Launching browser and loading GeeTest widget…")
         await page.goto(_PAGE_URL, wait_until="domcontentloaded")
@@ -380,20 +389,42 @@ async def _solve_async(
                         function extractUrl(el) {
                             if (!el) return null;
                             try {
+                                // background-image CSS
                                 var bi = window.getComputedStyle(el).backgroundImage;
                                 var m = bi && bi.match(/url\\(["']?([^"')]+)["']?\\)/);
-                                return m ? m[1] : null;
-                            } catch(e) { return null; }
+                                if (m) return m[1];
+                                // <img src> fallback
+                                if (el.tagName === 'IMG' && el.src) return el.src;
+                            } catch(e) {}
+                            return null;
                         }
-                        var bgEls = Array.from(document.querySelectorAll('[class*="geetest_bg"]'));
-                        var bgEl = bgEls.find(function(el) {
-                            return el.className.indexOf('fullbg') === -1;
-                        });
-                        var fullbgEl = document.querySelector('[class*="geetest_fullbg"]');
-                        return {
-                            bg:     extractUrl(bgEl),
-                            fullbg: extractUrl(fullbgEl),
-                        };
+                        function searchDoc(doc) {
+                            var bgUrl = null, fullbgUrl = null;
+                            var els = Array.from(doc.querySelectorAll('[class*="geetest_bg"], [class*="geetest_bg_"]'));
+                            for (var el of els) {
+                                var cls = el.className || '';
+                                var url = extractUrl(el);
+                                if (!url) continue;
+                                if (!fullbgUrl && (cls.indexOf('fullbg') !== -1 || cls.indexOf('full_bg') !== -1)) {
+                                    fullbgUrl = url;
+                                } else if (!bgUrl && cls.indexOf('fullbg') === -1 && cls.indexOf('full_bg') === -1) {
+                                    bgUrl = url;
+                                }
+                            }
+                            return {bg: bgUrl, fullbg: fullbgUrl};
+                        }
+                        var result = searchDoc(document);
+                        if (result.bg && result.fullbg) return result;
+                        // Also search iframes (GeeTest sometimes sandboxes in an iframe)
+                        try {
+                            for (var i = 0; i < frames.length; i++) {
+                                try {
+                                    var r = searchDoc(frames[i].document);
+                                    if (r.bg && r.fullbg) return r;
+                                } catch(e) {}
+                            }
+                        } catch(e) {}
+                        return result;
                     }
                 """)
                 if dom_imgs and dom_imgs.get("bg") and dom_imgs.get("fullbg"):

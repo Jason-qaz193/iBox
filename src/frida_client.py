@@ -282,11 +282,19 @@ class IBoxRPCClient:
     def _url(self, path: str) -> str:
         return self.base_url + (path if path.startswith("/") else "/" + path)
 
-    def _headers(self) -> dict:
+    def _headers(self, extra_headers: dict | None = None) -> dict:
         hdrs = dict(self._http.headers)
         hdrs["msg-id"] = f"{uuid.uuid4()}_android"
         if self.token:
             hdrs["Authorization"] = f"Bearer {self.token}"
+        if extra_headers:
+            for key, value in extra_headers.items():
+                if value is None:
+                    for existing in list(hdrs):
+                        if existing.lower() == key.lower():
+                            hdrs.pop(existing, None)
+                    continue
+                hdrs[key] = value
         return hdrs
 
     def _decode_response(self, resp: requests.Response) -> dict:
@@ -323,9 +331,15 @@ class IBoxRPCClient:
 
         return body
 
-    def _request(self, method: str, path: str, payload: dict | None = None) -> dict:
+    def _request(
+        self,
+        method: str,
+        path: str,
+        payload: dict | None = None,
+        headers: dict | None = None,
+    ) -> dict:
         kwargs = {
-            "headers": self._headers(),
+            "headers": self._headers(headers),
             "timeout": 30,
         }
         if payload is not None:
@@ -386,11 +400,11 @@ class IBoxRPCClient:
     def confirm_synthesis(self, path: str, payload: dict | None = None) -> dict:
         return self._request("POST", path, payload or {})
 
-    def get(self, path: str) -> dict:
-        return self._request("GET", path)
+    def get(self, path: str, headers: dict | None = None) -> dict:
+        return self._request("GET", path, headers=headers)
 
-    def post(self, path: str, payload: dict | None = None) -> dict:
-        return self._request("POST", path, payload)
+    def post(self, path: str, payload: dict | None = None, headers: dict | None = None) -> dict:
+        return self._request("POST", path, payload, headers=headers)
 
 
 # ── GeeTest captcha polling ───────────────────────────────────────────────────

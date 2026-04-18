@@ -326,9 +326,34 @@ python run.py wanted-detail 13800138000 123456 112333982
 
 ### 10. 成交一个求购单
 
+**方式一 — 按藏品名称自动查找（推荐）：**
+
 ```bash
-python run.py wanted-deal 13800138000 123456 112333982 72906965 --payload @payload.json
+python run.py wanted-deal 13800138000 - \
+  --collection-name "星空机器人" \
+  --quantity 1 \
+  --min-price 99.0 \
+  --consignment-password 123456
 ```
+
+自动流程：
+1. 查用户藏品列表，按名称（子串匹配）找到对应 `group_id`
+2. 查该 group 的求购单列表，过滤掉出价低于 `--min-price` 或数量不足 `--quantity` 的
+3. 取出价最高的求购单，调 `wanted-detail` 获取 `relation_id`
+4. 发起成交请求，body 自动附带寄售密码
+
+可选：`--dry-run` 只打印匹配到的求购单，不真正成交。
+
+可选：`--po-page-size 50` 控制求购单翻页大小（默认 50）。
+
+**方式二 — 直接传 ID：**
+
+```bash
+python run.py wanted-deal 13800138000 - 112333982 72906965 \
+  --consignment-password 123456
+```
+
+也可以用 `--payload @payload.json` 传自定义额外字段（会和 `--consignment-password` 合并）。
 
 对应接口：
 
@@ -403,7 +428,7 @@ python run.py consign-create 13800138000 123456 --cid your_cid --payload @payloa
 7. 准备某个写操作的 `payload.json`
 8. `python run.py consign-create ... --payload @payload.json`
 9. `python run.py consign-cancel ...`
-10. `python run.py wanted-deal ... --payload @payload.json`
+10. `python run.py wanted-deal ... --collection-name "藏品名" --min-price 99 --consignment-password 123456`
 
 ## 目前和“token 持久化复用”相比的差异
 
@@ -437,7 +462,4 @@ python run.py consign-create 13800138000 123456 --cid your_cid --payload @payloa
 
 - `--python` 纯 Python 模式仍然只是实验性质
 - README 里列出的二级市场接口路径是已从抓包确认的，但部分写操作请求体字段还没完全还原
-- 当前没有 token 持久化
-- 当前没有自动刷新验证码/自动重试机制
-
-如果你下一步要做“登录一次保存 token 到本地 json 后复用”，我可以直接继续把这块补到 `run.py` 和 `src/frida_client.py`。 
+- `wanted-deal --collection-name` 模式下 `relation_id` 从 `wanted-detail` 响应自动提取，若 API 返回结构变化可能需要补充字段别名
