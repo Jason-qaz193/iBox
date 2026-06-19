@@ -11,8 +11,10 @@ Modes:
 """
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
 import json
+import re
 import os
 import sys
 import threading
@@ -163,8 +165,8 @@ def build_parser(config: dict | None = None) -> argparse.ArgumentParser:
     synthesis_auto.add_argument(
         "--max-rounds",
         type=int,
-        default=20,
-        help="Maximum scan rounds; each round re-checks all recipes after successful synthesis",
+        default=0,
+        help="Maximum scan cycles (0 = unlimited until done or --target-count reached)",
     )
     synthesis_auto.add_argument(
         "--target-count",
@@ -197,37 +199,22 @@ def build_parser(config: dict | None = None) -> argparse.ArgumentParser:
         help="Only print the discovered synthesis plans without submitting",
     )
     synthesis_auto.add_argument(
-        "--captcha-mode",
-        choices=["auto", "manual", "skip"],
-        default="auto",
-        help=(
-            "How to handle the GeeTest V4 captcha that submit triggers: "
-            "auto=try Playwright first then fall back to manual, "
-            "manual=wait for user to solve in the app (LSPosed hook captures result), "
-            "skip=do NOT call confirm (legacy broken behaviour, synthesis stays pending)"
-        ),
+        "--scan-concurrency",
+        type=int,
+        default=4,
+        help="Parallel workers for activity-detail and synthesis-center requests (default: 4)",
     )
     synthesis_auto.add_argument(
-        "--captcha-timeout",
+        "--loop-interval",
         type=float,
-        default=120.0,
-        help="Seconds to wait for captcha result (manual mode) or Playwright solve timeout",
-    )
-    synthesis_auto.add_argument(
-        "--captcha-id",
-        default="0d4b08eac1cbdcad36bbf607c5bf3e1b",
-        help="GeeTest captcha_id for iBox (default matches production app)",
-    )
-    synthesis_auto.add_argument(
-        "--captcha-headed",
-        action="store_true",
-        help="Show the browser window when using Playwright captcha auto-solve",
+        default=2.0,
+        help="Seconds to wait before re-scanning when activities are not ready yet (default: 2)",
     )
     synthesis_auto.add_argument(
         "--detail-interval",
         type=float,
         default=0.3,
-        help="Seconds to wait between each activity-detail request to avoid 429 (default: 0.3)",
+        help="Seconds to wait between activity-detail requests when --scan-concurrency=1 (default: 0.3)",
     )
     synthesis_auto.add_argument(
         "--pre-center-offset",
@@ -240,6 +227,28 @@ def build_parser(config: dict | None = None) -> argparse.ArgumentParser:
         type=float,
         default=60.0,
         help="Start polling this many seconds before the activity opens (default: 60)",
+    )
+    synthesis_auto.add_argument(
+        "--captcha-mode",
+        choices=["auto", "manual", "skip"],
+        default="auto",
+        help="Only used when synthesis-center returns needSlider=1",
+    )
+    synthesis_auto.add_argument(
+        "--captcha-timeout",
+        type=float,
+        default=120.0,
+        help="Seconds to wait for captcha when needSlider=1",
+    )
+    synthesis_auto.add_argument(
+        "--captcha-id",
+        default="0d4b08eac1cbdcad36bbf607c5bf3e1b",
+        help="GeeTest captcha_id when needSlider=1",
+    )
+    synthesis_auto.add_argument(
+        "--captcha-headed",
+        action="store_true",
+        help="Show browser window for Playwright captcha solve when needSlider=1",
     )
 
     synthesis_confirm = subparsers.add_parser("synthesis-confirm", help="Confirm synthesis with captcha params")
@@ -254,15 +263,91 @@ def build_parser(config: dict | None = None) -> argparse.ArgumentParser:
 
     market_buy = subparsers.add_parser("market-buy", help="Create batch purchase-consignment order")
     add_auth_args(market_buy)
-    add_payload_arg(market_buy)
+    market_buy.add_argument("--collection-name", dest="collection_name", default="", help="藏品名称")
+    market_buy.add_argument("--price", dest="price", type=float, default=None, help="最高单价（元）")
+    market_buy.add_argument("--quantity", dest="quantity", type=positive_int, default=1, help="购买数量 (default: 1)")
+    market_buy.add_argument(
+        "--payment-platform",
+        dest="payment_platform",
+        type=int,
+        default=None,
+        help="支付平台代码 (default: 30)",
+    )
+    add_payload_arg(market_buy, required=False)
 
-    consign_create = subparsers.add_parser("consign-create", help="Create a consignment order")
+    consign_create = subparsers.add_parser(
+        "consign-create",
+        help="Create consignment listing(s) from owned collections",
+    )
     add_auth_args(consign_create)
-    add_payload_arg(consign_create)
+    consign_create.add_argument(
+        "--支付密码",
+        dest="consignment_password",
+        required=True,
+        help="寄售/支付密码",
+    )
+    consign_create.add_argument(
+        "--藏品名字",
+        dest="collection_name",
+        required=True,
+        help="藏品名称（匹配「我的藏品」分组名）",
+    )
+    consign_create.add_argument(
+        "--出售价格",
+        dest="price",
+        type=float,
+        required=True,
+        help="寄售单价（元）",
+    )
+    consign_create.add_argument(
+        "--出售数量",
+        dest="quantity",
+        type=positive_int,
+        required=True,
+        help="寄售数量",
+    )
+    consign_create.add_argument("--group-id", dest="group_id", default="", help="藏品分组 ID（可代替 --藏品名字）")
+    consign_create.add_argument(
+        "--payment-platform",
+        dest="payment_platform",
+        type=int,
+        default=None,
+        help="支付方式代码，写入 paymentPlatformCodes（默认 30）",
+    )
+    add_payload_arg(consign_create, required=False)
 
-    consign_cancel = subparsers.add_parser("consign-cancel", help="Cancel a consignment order")
+    consign_cancel = subparsers.add_parser(
+        "consign-cancel",
+        help="Cancel consignment listing(s) for a collection by name",
+    )
     add_auth_args(consign_cancel)
-    consign_cancel.add_argument("consign_order_id")
+    consign_cancel.add_argument(
+        "--支付密码",
+        dest="consignment_password",
+        required=True,
+        help="寄售/支付密码",
+    )
+    consign_cancel.add_argument(
+        "--藏品名字",
+        dest="collection_name",
+        required=True,
+        help="藏品名称（匹配「我的藏品」分组名）",
+    )
+    consign_cancel.add_argument(
+        "--下架价格",
+        dest="price",
+        type=float,
+        required=True,
+        help="仅下架指定单价（元）的寄售单",
+    )
+    consign_cancel.add_argument(
+        "--下架数量",
+        dest="quantity",
+        type=positive_int,
+        required=True,
+        help="下架数量",
+    )
+    consign_cancel.add_argument("--group-id", dest="group_id", default="", help="藏品分组 ID（可代替 --藏品名字）")
 
     purchase_detail = subparsers.add_parser("purchase-detail", help="Get purchase-consignment order detail")
     add_auth_args(purchase_detail)
@@ -521,6 +606,419 @@ def positive_int(value: str) -> int:
     if parsed <= 0:
         raise argparse.ArgumentTypeError("must be a positive integer")
     return parsed
+
+
+_OWNED_COLLECTION_ID_KEYS = (
+    "id",
+    "digitalCollectionId",
+    "collectionId",
+    "digitalCollectionID",
+    "collectionID",
+)
+
+
+def normalize_collection_name(name: str | None) -> str:
+    """Match keys for collection names; ignore punctuation and spaces."""
+    if name is None:
+        return ""
+    normalized = str(name).strip()
+    normalized = re.sub(
+        r"[^\u4E00-\u9FFF\u3400-\u4DBF\uF900-\uFAFFA-Za-z0-9\u2160-\u2169]+",
+        "",
+        normalized,
+    )
+    return normalized.lower()
+
+
+def collection_group_display_name(group: dict) -> str:
+    return str(
+        first_present(
+            group,
+            ("name", "groupName", "collectionName", "title", "digitalCollectionGroupName"),
+        )
+        or ""
+    ).strip()
+
+
+def _match_collection_groups(groups_list: list, collection_name: str) -> list[dict]:
+    normalized_target = normalize_collection_name(collection_name)
+    if not normalized_target:
+        return [
+            g
+            for g in groups_list
+            if isinstance(g, dict) and collection_name in collection_group_display_name(g)
+        ]
+
+    matched: list[dict] = []
+    for group in groups_list:
+        if not isinstance(group, dict):
+            continue
+        normalized_name = normalize_collection_name(collection_group_display_name(group))
+        if not normalized_name:
+            continue
+        if normalized_target in normalized_name or normalized_name in normalized_target:
+            matched.append(group)
+
+    exact = [
+        g
+        for g in matched
+        if normalize_collection_name(collection_group_display_name(g)) == normalized_target
+    ]
+    return exact or matched
+
+
+def fetch_owned_collection_groups(client) -> list[dict] | dict:
+    """Fetch owned collection groups (paginated). Returns auth-failure dict on 401."""
+    all_groups: list[dict] = []
+    seen_keys: set[str] = set()
+    page_size = 20
+    query_variants = [{"groupType": 0}, {"groupType": 1}]
+
+    for variant in query_variants:
+        page_no = 1
+        while True:
+            result = client.get(
+                "/personal-center-service/users/digital-collection-groups"
+                f"?groupType={variant['groupType']}&pageNo={page_no}&pageSize={page_size}"
+            )
+            if is_auth_failure(result):
+                return result
+            if isinstance(result, dict) and result.get("rpcBridgeNotReady"):
+                return result
+            if not is_success(result):
+                code = result.get("code")
+                if str(code) == "401":
+                    return result
+                break
+
+            groups_data = (result.get("data") or {})
+            groups_list = groups_data if isinstance(groups_data, list) else (
+                groups_data.get("list") or groups_data.get("records") or groups_data.get("data") or []
+            )
+            if isinstance(groups_list, list):
+                for group in groups_list:
+                    if not isinstance(group, dict):
+                        continue
+                    gid = first_present(
+                        group,
+                        ("id", "groupId", "digitalCollectionGroupId", "collectionGroupId"),
+                    )
+                    key = str(gid) if gid not in (None, "") else collection_group_display_name(group)
+                    if key and key not in seen_keys:
+                        seen_keys.add(key)
+                        all_groups.append(group)
+
+            has_more = False
+            if isinstance(groups_data, dict):
+                has_more = bool(groups_data.get("hasMore"))
+            if not has_more and isinstance(groups_list, list) and len(groups_list) < page_size:
+                break
+            if not groups_list:
+                break
+            page_no += 1
+            if page_no > 50:
+                break
+    return all_groups
+
+
+def suggest_owned_collection_names(groups_list: list, collection_name: str, *, limit: int = 8) -> list[str]:
+    target = normalize_collection_name(collection_name)
+    if not target:
+        return []
+    ranked: list[tuple[int, str]] = []
+    for group in groups_list:
+        if not isinstance(group, dict):
+            continue
+        display = collection_group_display_name(group)
+        if not display:
+            continue
+        norm = normalize_collection_name(display)
+        if not norm:
+            continue
+        if norm == target:
+            score = 0
+        elif target in norm or norm in target:
+            score = 1
+        elif target[:2] in norm:
+            score = 2
+        else:
+            continue
+        ranked.append((score, display))
+    ranked.sort(key=lambda item: (item[0], len(item[1])))
+    seen: set[str] = set()
+    suggestions: list[str] = []
+    for _, display in ranked:
+        if display in seen:
+            continue
+        seen.add(display)
+        suggestions.append(display)
+        if len(suggestions) >= limit:
+            break
+    return suggestions
+
+
+def resolve_group_id_by_public_market(
+    client,
+    collection_name: str,
+    *,
+    search_pages: int = 10,
+    segment_id: str = "-1",
+) -> str | dict:
+    normalized_target = normalize_collection_name(collection_name)
+    if not normalized_target and not (collection_name or "").strip():
+        raise SystemExit(f"Error: invalid collection name '{collection_name}'")
+
+    seen = set()
+    for page_no in range(1, max(1, int(search_pages)) + 1):
+        path = (
+            "/public-service/markets"
+            f"?sortType=0&pageNo={page_no}&segmentId={segment_id}"
+            "&sortField=2&pageSize=50&timeRange=0"
+        )
+        result = client.get(path)
+        if is_auth_failure(result):
+            return result
+        if not is_success(result):
+            continue
+        for item in extract_list_payload(result):
+            if not isinstance(item, dict):
+                continue
+            name = first_present(item, ("name", "groupName", "collectionName", "title"))
+            if not name:
+                continue
+            if normalized_target:
+                if normalized_target not in normalize_collection_name(str(name)):
+                    continue
+            elif collection_name not in str(name):
+                continue
+            gid = first_present(item, ("id", "groupId", "collectionGroupId", "digitalCollectionGroupId"))
+            if gid in (None, "") or str(gid) in seen:
+                continue
+            seen.add(str(gid))
+            print(f"[resolve] public market: {name!r} -> group_id={gid}", flush=True)
+            return str(gid)
+        data = result.get("data")
+        if isinstance(data, dict) and data.get("hasMore") is False:
+            break
+    return ""
+
+
+def resolve_group_id_for_consign(
+    client,
+    collection_name: str,
+) -> tuple[str, str, dict | None]:
+    owned = fetch_owned_collection_groups(client)
+    if isinstance(owned, dict):
+        return "", "", owned
+
+    matched = _match_collection_groups(owned, collection_name)
+    if matched:
+        group_id = str(
+            first_present(
+                matched[0],
+                ("id", "groupId", "digitalCollectionGroupId", "collectionGroupId"),
+            )
+        )
+        display = collection_group_display_name(matched[0]) or collection_name
+        print(
+            f"[consign-create] matched owned group: {display!r} -> group_id={group_id}",
+            flush=True,
+        )
+        return group_id, display, None
+
+    public = resolve_group_id_by_public_market(client, collection_name)
+    if isinstance(public, dict):
+        return "", "", public
+    if public:
+        owned_items = list_unlocked_digital_collection_ids(client, public, limit=1)
+        if owned_items:
+            print(
+                f"[consign-create] resolved via public market (owned items found): group_id={public}",
+                flush=True,
+            )
+            return public, collection_name, None
+
+    return "", "", None
+
+
+def resolve_group_id_for_market(client, collection_name: str, config: dict | None = None) -> str | dict:
+    """Prefer public market lookup; fall back to owned collections."""
+    public = resolve_group_id_by_public_market(client, collection_name)
+    if isinstance(public, dict):
+        return public
+    if public:
+        print(f"[market-buy] public market: {collection_name!r} -> group_id={public}", flush=True)
+        return public
+
+    owned = fetch_owned_collection_groups(client)
+    if isinstance(owned, dict):
+        return owned
+    matched = _match_collection_groups(owned, collection_name)
+    if matched:
+        group_id = str(
+            first_present(
+                matched[0],
+                ("id", "groupId", "digitalCollectionGroupId", "collectionGroupId"),
+            )
+        )
+        print(f"[market-buy] owned group: {collection_name!r} -> group_id={group_id}", flush=True)
+        return group_id
+
+    raise SystemExit(f"Error: collection '{collection_name}' not found in public market or your wallet")
+
+
+def build_market_buy_payload(
+    group_id: str,
+    price_yuan: float,
+    quantity: int,
+    payment_platform: int,
+    *,
+    extra: dict | None = None,
+) -> dict:
+    price_fen = int(round(float(price_yuan) * 100))
+    payload = {
+        "digitalCollectionGroupId": int(group_id),
+        "maxCount": max(1, int(quantity)),
+        "maxSinglePrice": price_fen,
+        "paymentPlatformCode": int(payment_platform),
+        "level": -1,
+    }
+    if extra:
+        payload.update(extra)
+    return payload
+
+
+def list_owned_collection_items(
+    client,
+    group_id: str,
+    *,
+    lock_status: int | None = None,
+    consigned_only: bool = False,
+) -> list[dict] | None:
+    items_out: list[dict] = []
+    page_no = 1
+    page_size = 50
+    while True:
+        path = (
+            f"/personal-center-service/users/digital-collection-groups/{group_id}"
+            f"?pageSize={page_size}&pageNo={page_no}"
+        )
+        if lock_status is not None:
+            path += f"&lockStatus={int(lock_status)}"
+        result = client.get(path)
+        if not is_success(result):
+            return None
+        items = extract_list_payload(result)
+        if not isinstance(items, list):
+            break
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            if consigned_only and int(item.get("consignmentStatus") or 0) != 1:
+                continue
+            items_out.append(item)
+        if len(items) < page_size:
+            break
+        data = result.get("data")
+        if isinstance(data, dict) and data.get("hasMore") is False:
+            break
+        page_no += 1
+        if page_no > 100:
+            break
+    return items_out
+
+
+def list_unlocked_digital_collection_ids(
+    client,
+    group_id: str,
+    *,
+    limit: int | None = None,
+) -> list[str] | None:
+    items = list_owned_collection_items(client, group_id, lock_status=0)
+    if items is None:
+        return None
+    collection_ids: list[str] = []
+    want = max(1, int(limit)) if limit is not None else None
+    for item in items:
+        cid = first_present(item, _OWNED_COLLECTION_ID_KEYS)
+        if cid not in (None, ""):
+            collection_ids.append(str(cid))
+            if want is not None and len(collection_ids) >= want:
+                return collection_ids[:want]
+    if want is not None:
+        return collection_ids[:want]
+    return collection_ids
+
+
+def list_consigned_orders_for_cancel(
+    client,
+    group_id: str,
+    *,
+    price_yuan: float | None = None,
+    limit: int | None = None,
+) -> tuple[list[dict], int] | None:
+    """Owned items with consignmentStatus=1; orderId is the consign-orders/{id}/cancel id."""
+    items = list_owned_collection_items(client, group_id, consigned_only=True)
+    if items is None:
+        return None
+    target_fen = int(round(float(price_yuan) * 100)) if price_yuan is not None else None
+    orders: list[dict] = []
+    for item in items:
+        consign_id = first_present(
+            item,
+            ("orderId", "consignOrderId", "consignmentOrderId", "consignmentOrderNo"),
+        )
+        if consign_id in (None, ""):
+            continue
+        if target_fen is not None:
+            item_fen = to_price_fen(item.get("price"))
+            if item_fen is None or item_fen != target_fen:
+                continue
+        orders.append(
+            {
+                "consign_order_id": str(consign_id),
+                "digital_collection_id": first_present(item, _OWNED_COLLECTION_ID_KEYS),
+                "name": item.get("name") or "",
+                "price": item.get("price"),
+            }
+        )
+    total_matched = len(orders)
+    if limit is not None:
+        orders = orders[: max(1, int(limit))]
+    return orders, total_matched
+
+
+def build_consign_password_fields(consignment_password: str) -> dict:
+    pwd = str(consignment_password)
+    return {
+        "consignPassword": pwd,
+        "consignmentPassword": pwd,
+        "password": pwd,
+        "consignmentPassWord": pwd,
+    }
+
+
+def build_consign_create_payload(
+    digital_collection_id: str,
+    price_yuan: float,
+    consignment_password: str,
+    *,
+    payment_platform_codes: list[int] | None = None,
+    extra: dict | None = None,
+) -> dict:
+    price_val: int | float = float(price_yuan)
+    if price_val == int(price_val):
+        price_val = int(price_val)
+    pwd = str(consignment_password)
+    payload = {
+        "digitalCollectionId": int(digital_collection_id),
+        "price": price_val,
+        "paymentPlatformCodes": [int(x) for x in (payment_platform_codes or [30])],
+        **build_consign_password_fields(pwd),
+    }
+    if extra:
+        payload.update(extra)
+    return payload
 
 
 def normalize_material_item(item: dict) -> dict | None:
@@ -1069,6 +1567,254 @@ def submit_synthesis_with_retry(*, client, submit_path: str, payload: dict, subm
     }
 
 
+def _fetch_single_activity_detail(*, worker_client, config, activity_id: str, detail_interval: float) -> dict:
+    detail_path = render_command_path(
+        config,
+        "synthesis-activity-detail",
+        "/synthesis-service/synthetic/activity/detail?id={activity_id}",
+        activity_id=activity_id,
+    )
+    detail_result = worker_client.get_synthesis_activity_detail(detail_path)
+    if isinstance(detail_result, dict) and str(detail_result.get("code", "")) == "429" or (
+        isinstance(detail_result, dict) and "429" in str(detail_result.get("_raw", ""))[:50]
+    ):
+        backoff = max(detail_interval * 3, 1.0)
+        print(f"[detail] 429 on activity {activity_id}, backing off {backoff:.1f}s…", flush=True)
+        time.sleep(backoff)
+        detail_result = worker_client.get_synthesis_activity_detail(detail_path)
+    return {"activity_id": activity_id, "detail": detail_result}
+
+
+def fetch_synthesis_activity_details_parallel(
+    *,
+    client,
+    config,
+    activity_ids: list[str],
+    detail_interval: float,
+    concurrency: int,
+) -> list[dict]:
+    if not activity_ids:
+        return []
+    workers = max(concurrency, 1)
+    if workers == 1:
+        activity_details = []
+        for idx, activity_id in enumerate(activity_ids):
+            if idx > 0 and detail_interval > 0:
+                time.sleep(detail_interval)
+            activity_details.append(
+                _fetch_single_activity_detail(
+                    worker_client=client,
+                    config=config,
+                    activity_id=activity_id,
+                    detail_interval=detail_interval,
+                )
+            )
+        return activity_details
+
+    activity_details: list[dict | None] = [None] * len(activity_ids)
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        future_map = {}
+        for index, activity_id in enumerate(activity_ids):
+            worker_client = build_parallel_submit_client(client)
+            future = executor.submit(
+                _fetch_single_activity_detail,
+                worker_client=worker_client,
+                config=config,
+                activity_id=activity_id,
+                detail_interval=detail_interval,
+            )
+            future_map[future] = index
+        for future in as_completed(future_map):
+            activity_details[future_map[future]] = future.result()
+    return [item for item in activity_details if item is not None]
+
+
+def resolve_synthetic_targets_from_details(
+    activity_details: list[dict],
+    pre_start_window: float,
+) -> tuple[list[str], dict[str, str], datetime | None]:
+    synthetic_ids: list[str] = []
+    synthetic_id_to_activity_id: dict[str, str] = {}
+    for item in activity_details:
+        detail_result = item.get("detail")
+        activity_id = str(item.get("activity_id", ""))
+        if is_success(detail_result):
+            new_ids = extract_synthetic_ids(detail_result)
+            for sid in new_ids:
+                synthetic_id_to_activity_id.setdefault(str(sid), activity_id)
+            synthetic_ids.extend(new_ids)
+
+    synthetic_ids = list(dict.fromkeys(synthetic_ids))
+    wait_target: datetime | None = None
+    if not synthetic_ids:
+        pre_ids, pre_id_map, pre_start = extract_upcoming_synthetic_ids_with_start(activity_details)
+        if pre_ids:
+            now_dt = datetime.now()
+            seconds_until = (pre_start - now_dt).total_seconds() if pre_start else 0
+            if pre_start and 0 < seconds_until <= pre_start_window:
+                print(
+                    f"[wait] Pre-fetched {len(pre_ids)} synthetic ID(s): {pre_ids}; "
+                    f"activity opens at {pre_start.strftime('%H:%M:%S')} "
+                    f"({seconds_until:.0f}s away) — waiting…",
+                    flush=True,
+                )
+                wait_target = pre_start
+            synthetic_ids = pre_ids
+            for sid, aid in pre_id_map.items():
+                synthetic_id_to_activity_id.setdefault(sid, aid)
+    else:
+        pre_ids, pre_id_map, earliest_start = extract_upcoming_synthetic_ids_with_start(activity_details)
+        active_set = set(synthetic_ids)
+        upcoming_ids = [sid for sid in pre_ids if sid not in active_set]
+        if upcoming_ids and earliest_start is not None and 0 < (earliest_start - datetime.now()).total_seconds() <= pre_start_window:
+            wait_target = earliest_start
+            synthetic_ids = upcoming_ids
+            for sid, aid in pre_id_map.items():
+                if sid in set(upcoming_ids):
+                    synthetic_id_to_activity_id.setdefault(sid, aid)
+        elif earliest_start is not None and 0 < (earliest_start - datetime.now()).total_seconds() <= pre_start_window:
+            wait_target = earliest_start
+
+    return synthetic_ids, synthetic_id_to_activity_id, wait_target
+
+
+def fetch_synthesis_centers_parallel(
+    *,
+    client,
+    config,
+    synthetic_ids: list[str],
+    concurrency: int,
+    pre_center_cache: dict[str, dict] | None = None,
+) -> dict[str, dict]:
+    center_results = dict(pre_center_cache or {})
+    pending = [str(synthetic_id) for synthetic_id in synthetic_ids if str(synthetic_id) not in center_results]
+    if not pending:
+        return center_results
+
+    def fetch_one(synthetic_id: str) -> tuple[str, dict]:
+        try:
+            worker_client = build_parallel_submit_client(client)
+            center_path = render_command_path(
+                config,
+                "synthesis-center",
+                "/synthesis-service/synthetic/center/{synthetic_id}",
+                synthetic_id=synthetic_id,
+            )
+            return synthetic_id, worker_client.get_synthesis_center(center_path)
+        except Exception as exc:
+            return synthetic_id, {"code": 1, "error": str(exc)}
+
+    workers = max(concurrency, 1)
+    if workers == 1:
+        for synthetic_id in pending:
+            sid, result = fetch_one(synthetic_id)
+            center_results[sid] = result
+        return center_results
+
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        for sid, result in executor.map(fetch_one, pending):
+            center_results[sid] = result
+    return center_results
+
+
+def run_pre_start_wait_and_pre_center(
+    *,
+    client,
+    config,
+    synthetic_ids: list[str],
+    wait_target: datetime,
+    pre_center_offset: float,
+    scan_concurrency: int,
+) -> dict[str, dict]:
+    seconds_until = (wait_target - datetime.now()).total_seconds()
+    print(
+        f"[wait] Activity opens at {wait_target.strftime('%H:%M:%S')} "
+        f"({seconds_until:.0f}s away) — will pre-fetch synthesis-center "
+        f"{pre_center_offset:.0f}s before start…",
+        flush=True,
+    )
+    pre_call_time = wait_target - timedelta(seconds=max(pre_center_offset, 0))
+    if pre_call_time > datetime.now():
+        _wait_until_start(pre_call_time)
+
+    pre_center_cache = fetch_synthesis_centers_parallel(
+        client=client,
+        config=config,
+        synthetic_ids=synthetic_ids,
+        concurrency=scan_concurrency,
+    )
+    for synthetic_id in synthetic_ids:
+        center_result = pre_center_cache.get(str(synthetic_id), {})
+        if is_success(center_result):
+            center_data = (center_result.get("data") or {})
+            surplus_num = to_int(first_present(center_data, ("surplusNum", "remainNum", "leftNum")))
+            print(
+                f"[pre-center] {synthetic_id} cached ✔"
+                + (f"  surplusNum={surplus_num}" if surplus_num is not None else ""),
+                flush=True,
+            )
+        else:
+            print(
+                f"[pre-center] {synthetic_id} failed ({center_result.get('code')}), will fetch live",
+                flush=True,
+            )
+
+    _wait_until_start(wait_target)
+    print("[wait] Activity start time reached, beginning synthesis attempts…", flush=True)
+    return pre_center_cache
+
+
+def synthesis_needs_slider(center_result: dict) -> bool:
+    center_data = (center_result or {}).get("data") or {}
+    need_slider = to_int(first_present(center_data, ("needSlider", "need_slider")))
+    return bool(need_slider)
+
+
+def build_synthesis_confirm_path(
+    config: dict,
+    uid: str,
+    captcha_params: dict | None = None,
+) -> str:
+    params = captcha_params or {}
+    return render_command_path(
+        config,
+        "synthesis-confirm",
+        (
+            "/synthesis-service/synthetic/center/confirm"
+            "?uid={uid}&captcha_id={captcha_id}"
+            "&lot_number={lot_number}&pass_token={pass_token}"
+            "&gen_time={gen_time}&captcha_output={captcha_output}"
+        ),
+        uid=uid or "",
+        captcha_id=params.get("captcha_id", ""),
+        lot_number=params.get("lot_number", ""),
+        pass_token=params.get("pass_token", ""),
+        gen_time=params.get("gen_time", ""),
+        captcha_output=params.get("captcha_output", ""),
+    )
+
+
+def build_synthesis_confirm_body(*, outer_activity_id: str, synthetic_id: str, synthetic_num: int) -> dict:
+    return {
+        "activityId": int(outer_activity_id) if outer_activity_id else None,
+        "syntheticNum": synthetic_num,
+        "syntheticId": int(synthetic_id),
+    }
+
+
+def resolve_outer_activity_id(
+    synthetic_id: str,
+    synthetic_id_to_activity_id: dict[str, str],
+    candidate: dict,
+) -> str:
+    outer_activity_id = synthetic_id_to_activity_id.get(str(synthetic_id), "")
+    if not outer_activity_id:
+        candidate_activity_id = candidate.get("activity_id")
+        if candidate_activity_id not in (None, ""):
+            outer_activity_id = str(candidate_activity_id)
+    return outer_activity_id
+
+
 def is_success(result: dict) -> bool:
     return isinstance(result, dict) and result.get("code") == 0
 
@@ -1531,63 +2277,43 @@ def main():
                 page_size=get_command_default(config, "synthesis-activity-list", "page_size", "100"),
             )
             submit_path = render_command_path(config, "synthesis-submit", "/synthesis-service/synthetic/center/submit")
-            confirm_path_template = render_command_path(
-                config,
-                "synthesis-confirm",
-                (
-                    "/synthesis-service/synthetic/center/confirm"
-                    "?uid={uid}&captcha_id={captcha_id}"
-                    "&lot_number={lot_number}&pass_token={pass_token}"
-                    "&gen_time={gen_time}&captcha_output={captcha_output}"
-                ),
-                uid="{uid}",
-                captcha_id="{captcha_id}",
-                lot_number="{lot_number}",
-                pass_token="{pass_token}",
-                gen_time="{gen_time}",
-                captcha_output="{captcha_output}",
-            )
 
             def _get_captcha_params(synth_id: str) -> tuple[dict | None, str | None]:
-                """
-                Obtain GeeTest V4 captcha params for the given synthetic_id.
-
-                Returns (params_dict, error_message).  params_dict keys:
-                    lot_number, pass_token, gen_time, captcha_output, captcha_id
-                """
-                cap_mode    = parsed.captcha_mode
+                cap_mode = parsed.captcha_mode
                 cap_timeout = parsed.captcha_timeout
-                cap_id      = parsed.captcha_id
+                cap_id = parsed.captcha_id
 
-                # ── auto / playwright ────────────────────────────────────────
                 if cap_mode in ("auto", "playwright"):
                     try:
                         from src.geetest_solver import playwright_solve, check_dependencies
                         ok, msg = check_dependencies()
                         if not ok:
                             raise ImportError(msg)
-                        print(f"[captcha] Auto-solving GeeTest V4 (synthetic_id={synth_id})…")
+                        print(f"[captcha] Auto-solving GeeTest V4 (synthetic_id={synth_id})…", flush=True)
                         result = playwright_solve(
                             captcha_id=cap_id,
                             timeout=cap_timeout,
                             headed=getattr(parsed, "captcha_headed", False),
                         )
                         if result and result.get("lot_number"):
-                            print(f"[captcha] Auto-solved ✓  lot_number={result['lot_number'][:8]}…")
+                            print(f"[captcha] Auto-solved ✓  lot_number={result['lot_number'][:8]}…", flush=True)
                             return result, None
                         raise RuntimeError(f"Playwright returned empty result: {result}")
                     except Exception as exc:
-                        print(f"[captcha] Auto-solve failed: {exc}")
+                        print(f"[captcha] Auto-solve failed: {exc}", flush=True)
                         if cap_mode == "playwright":
                             return None, f"Playwright captcha solve failed: {exc}"
-                        print("[captcha] Falling back to manual mode…")
+                        print("[captcha] Falling back to manual mode…", flush=True)
 
-                # ── manual ───────────────────────────────────────────────────
+                if cap_mode == "skip":
+                    return None, "Captcha required (needSlider=1) but --captcha-mode=skip"
+
                 print(
                     f"[captcha] Please solve the GeeTest slider captcha in the iBox app "
-                    f"(synthetic_id={synth_id})"
+                    f"(synthetic_id={synth_id})",
+                    flush=True,
                 )
-                print(f"[captcha] Waiting up to {cap_timeout:.0f} s for captcha result…")
+                print(f"[captcha] Waiting up to {cap_timeout:.0f} s for captcha result…", flush=True)
                 from src.frida_client import poll_captcha
                 params = poll_captcha(
                     device_host=device_host,
@@ -1595,189 +2321,131 @@ def main():
                     clear_before=True,
                 )
                 if params:
-                    print(f"[captcha] Captured from app ✓  lot_number={params['lot_number'][:8]}…")
+                    print(f"[captcha] Captured from app ✓  lot_number={params['lot_number'][:8]}…", flush=True)
                     return params, None
                 return None, f"Captcha not obtained within {cap_timeout:.0f} s"
 
             def synthesis_auto_operation():
-                activity_list_result = client.get_synthesis_activity_list(activity_list_path)
-                if not is_success(activity_list_result):
-                    return {
-                        "code": activity_list_result.get("code", 1),
-                        "activity_list": activity_list_result,
-                    }
-
-                activity_ids = extract_activity_ids(activity_list_result)
-                if not activity_ids:
-                    return {
-                        "code": 1,
-                        "activity_list": activity_list_result,
-                        "error": "Could not discover any synthesis activities from synthesis-activity-list response.",
-                    }
-
-                activity_details = []
-                synthetic_ids = []
-                synthetic_id_to_activity_id: dict[str, str] = {}
-                for idx, activity_id in enumerate(activity_ids):
-                    if idx > 0 and parsed.detail_interval > 0:
-                        time.sleep(parsed.detail_interval)
-                    detail_path = render_command_path(
-                        config,
-                        "synthesis-activity-detail",
-                        "/synthesis-service/synthetic/activity/detail?id={activity_id}",
-                        activity_id=activity_id,
-                    )
-                    detail_result = client.get_synthesis_activity_detail(detail_path)
-                    # 429: back off and retry once
-                    if isinstance(detail_result, dict) and str(detail_result.get("code", "")) == "429" or (
-                        isinstance(detail_result, dict) and "429" in str(detail_result.get("_raw", ""))[:50]
-                    ):
-                        backoff = max(parsed.detail_interval * 3, 1.0)
-                        print(f"[detail] 429 on activity {activity_id}, backing off {backoff:.1f}s…", flush=True)
-                        time.sleep(backoff)
-                        detail_result = client.get_synthesis_activity_detail(detail_path)
-                    activity_details.append({"activity_id": activity_id, "detail": detail_result})
-                    if is_success(detail_result):
-                        new_ids = extract_synthetic_ids(detail_result)
-                        for sid in new_ids:
-                            synthetic_id_to_activity_id.setdefault(str(sid), str(activity_id))
-                        synthetic_ids.extend(new_ids)
-
-                synthetic_ids = list(dict.fromkeys(synthetic_ids))
-                if not synthetic_ids:
-                    # Pre-fetch: extract upcoming channel IDs from already-fetched details
-                    # (bypasses the is_channel_active start-time filter in extract_synthetic_ids)
-                    pre_ids, pre_id_map, pre_start = extract_upcoming_synthetic_ids_with_start(activity_details)
-                    if pre_ids:
-                        now_dt = datetime.now()
-                        seconds_until = (pre_start - now_dt).total_seconds() if pre_start else 0
-                        if pre_start and 0 < seconds_until <= parsed.pre_start_window:
-                            print(
-                                f"[wait] Pre-fetched {len(pre_ids)} synthetic ID(s): {pre_ids}; "
-                                f"activity opens at {pre_start.strftime('%H:%M:%S')} "
-                                f"({seconds_until:.0f}s away) — waiting (no re-fetch needed)…"
-                            )
-                            wait_target = pre_start
-                        else:
-                            wait_target = None
-                        synthetic_ids = pre_ids
-                        for sid, aid in pre_id_map.items():
-                            synthetic_id_to_activity_id.setdefault(sid, aid)
-                    else:
-                        wait_target = None
-                else:
-                    # synthetic_ids already known — but also check for upcoming channels
-                    # that will start soon (e.g. a 抖合 window about to open).  If any
-                    # not-yet-active channels fall within pre_start_window, wait for those
-                    # and synthesize them instead of the currently-active ones.
-                    pre_ids, pre_id_map, _es = extract_upcoming_synthetic_ids_with_start(activity_details)
-                    active_set = set(synthetic_ids)
-                    upcoming_ids = [sid for sid in pre_ids if sid not in active_set]
-                    if upcoming_ids and _es is not None and 0 < (_es - datetime.now()).total_seconds() <= parsed.pre_start_window:
-                        wait_target = _es
-                        synthetic_ids = upcoming_ids
-                        for sid, aid in pre_id_map.items():
-                            if sid in set(upcoming_ids):
-                                synthetic_id_to_activity_id.setdefault(sid, aid)
-                    elif _es is not None and 0 < (_es - datetime.now()).total_seconds() <= parsed.pre_start_window:
-                        wait_target = _es
-                    else:
-                        wait_target = None
-
-                if not synthetic_ids:
-                    return {
-                        "code": 1,
-                        "activity_list": activity_list_result,
-                        "activity_details": activity_details,
-                        "error": (
-                            "Could not discover any synthetic ids from synthesis activity details. "
-                            "Inspect result.activity_details and adjust parser aliases if needed."
-                        ),
-                    }
-
-                # Pre-call synthesis-center during the wait so round 1 can skip it
-                pre_center_cache: dict[str, dict] = {}
-                if wait_target is not None:
-                    seconds_until = (wait_target - datetime.now()).total_seconds()
-                    print(
-                        f"[wait] Activity opens at {wait_target.strftime('%H:%M:%S')} "
-                        f"({seconds_until:.0f}s away) — will pre-fetch synthesis-center "
-                        f"{parsed.pre_center_offset:.0f}s before start…"
-                    )
-                    # Sleep until pre_center_offset seconds before start
-                    pre_call_time = wait_target - timedelta(seconds=max(parsed.pre_center_offset, 0))
-                    if pre_call_time > datetime.now():
-                        _wait_until_start(pre_call_time)
-                    # Pre-call synthesis-center for each id
-                    for _sid in synthetic_ids:
-                        _center_path = render_command_path(
-                            config,
-                            "synthesis-center",
-                            "/synthesis-service/synthetic/center/{synthetic_id}",
-                            synthetic_id=_sid,
-                        )
-                        _center_result = client.get_synthesis_center(_center_path)
-                        if is_success(_center_result):
-                            pre_center_cache[str(_sid)] = _center_result
-                            _cdata = (_center_result.get("data") or {})
-                            _surplus = to_int(first_present(_cdata, ("surplusNum", "remainNum", "leftNum")))
-                            print(
-                                f"[pre-center] {_sid} cached ✔"
-                                + (f"  surplusNum={_surplus}" if _surplus is not None else ""),
-                                flush=True,
-                            )
-                        else:
-                            print(f"[pre-center] {_sid} failed ({_center_result.get('code')}), will fetch live", flush=True)
-                    # Tight spin for remaining time
-                    _wait_until_start(wait_target)
-                    print("[wait] Activity start time reached, beginning synthesis attempts…")
-
-                rounds = []
+                cycles = []
                 successful_submits = []
-                successful_state_by_synthetic_id = {}
+                successful_state_by_synthetic_id: dict[str, tuple] = {}
                 remaining_target_count = parsed.target_count
-                for round_no in range(1, max(parsed.max_rounds, 1) + 1):
-                    if remaining_target_count is not None and remaining_target_count <= 0:
+                last_activity_list_result = None
+                last_activity_details: list[dict] = []
+                last_synthetic_ids: list[str] = []
+                cycle_no = 0
+
+                while True:
+                    cycle_no += 1
+                    if parsed.max_rounds > 0 and cycle_no > parsed.max_rounds:
+                        print(f"[cycle {cycle_no - 1}] Reached --max-rounds={parsed.max_rounds}, stopping.", flush=True)
                         break
-                    round_entries = []
-                    round_progress = False
+                    if remaining_target_count is not None and remaining_target_count <= 0:
+                        print(f"[cycle {cycle_no}] Target count reached, stopping.", flush=True)
+                        break
+
+                    print(f"[cycle {cycle_no}] Fetching latest synthesis activities…", flush=True)
+                    activity_list_result = client.get_synthesis_activity_list(activity_list_path)
+                    last_activity_list_result = activity_list_result
+                    if not is_success(activity_list_result):
+                        print(
+                            f"[cycle {cycle_no}] activity-list failed ({activity_list_result.get('code')}), "
+                            f"retry in {parsed.loop_interval:.1f}s…",
+                            flush=True,
+                        )
+                        time.sleep(max(parsed.loop_interval, 0.1))
+                        continue
+
+                    activity_ids = extract_activity_ids(activity_list_result)
+                    if not activity_ids:
+                        print(
+                            f"[cycle {cycle_no}] No activities found, retry in {parsed.loop_interval:.1f}s…",
+                            flush=True,
+                        )
+                        time.sleep(max(parsed.loop_interval, 0.1))
+                        continue
+
+                    activity_details = fetch_synthesis_activity_details_parallel(
+                        client=client,
+                        config=config,
+                        activity_ids=activity_ids,
+                        detail_interval=parsed.detail_interval,
+                        concurrency=parsed.scan_concurrency,
+                    )
+                    last_activity_details = activity_details
+
+                    synthetic_ids, synthetic_id_to_activity_id, wait_target = resolve_synthetic_targets_from_details(
+                        activity_details,
+                        parsed.pre_start_window,
+                    )
+                    last_synthetic_ids = synthetic_ids
+
+                    if not synthetic_ids:
+                        print(
+                            f"[cycle {cycle_no}] No synthetic ids discovered, retry in {parsed.loop_interval:.1f}s…",
+                            flush=True,
+                        )
+                        time.sleep(max(parsed.loop_interval, 0.1))
+                        continue
+
+                    pre_center_cache: dict[str, dict] = {}
+                    if wait_target is not None and wait_target > datetime.now():
+                        pre_center_cache = run_pre_start_wait_and_pre_center(
+                            client=client,
+                            config=config,
+                            synthetic_ids=synthetic_ids,
+                            wait_target=wait_target,
+                            pre_center_offset=parsed.pre_center_offset,
+                            scan_concurrency=parsed.scan_concurrency,
+                        )
+
+                    center_results = fetch_synthesis_centers_parallel(
+                        client=client,
+                        config=config,
+                        synthetic_ids=synthetic_ids,
+                        concurrency=parsed.scan_concurrency,
+                        pre_center_cache=pre_center_cache,
+                    )
+
+                    cycle_entries = []
+                    cycle_progress = False
+                    any_craftable = False
                     for synthetic_id in synthetic_ids:
                         if remaining_target_count is not None and remaining_target_count <= 0:
                             break
-                        center_path = render_command_path(
-                            config,
-                            "synthesis-center",
-                            "/synthesis-service/synthetic/center/{synthetic_id}",
-                            synthetic_id=synthetic_id,
-                        )
-                        center_result = pre_center_cache.pop(str(synthetic_id), None)
-                        if center_result is not None:
-                            print(f"[round {round_no}] using pre-fetched center for synthetic_id={synthetic_id}", flush=True)
-                        else:
-                            center_result = client.get_synthesis_center(center_path)
+
+                        center_result = center_results.get(str(synthetic_id), {})
+                        if str(synthetic_id) in pre_center_cache:
+                            print(
+                                f"[cycle {cycle_no}] using pre-fetched center for synthetic_id={synthetic_id}",
+                                flush=True,
+                            )
                         entry = {
                             "synthetic_id": synthetic_id,
                             "center": center_result,
                         }
                         if not is_success(center_result):
                             entry["code"] = center_result.get("code", 1)
-                            round_entries.append(entry)
+                            cycle_entries.append(entry)
                             continue
 
                         candidates = extract_recipe_candidates(center_result)
                         if not candidates:
                             entry["code"] = 1
                             entry["error"] = "Could not derive synthesis materials from synthesis-center response."
-                            round_entries.append(entry)
+                            cycle_entries.append(entry)
                             continue
 
                         candidate = choose_recipe_candidate(candidates, synthetic_id)
                         max_times = candidate.get("max_times", 0)
-                        # Respect the server-side per-user synthesis cap
                         center_data = (center_result or {}).get("data") or {}
                         surplus_num = to_int(first_present(center_data, ("surplusNum", "remainNum", "leftNum")))
                         max_synthetic_num = to_int(first_present(center_data, ("maxSyntheticNum", "maxNum")))
-                        server_cap = min(v for v in (surplus_num, max_synthetic_num) if v is not None) if any(v is not None for v in (surplus_num, max_synthetic_num)) else None
+                        server_cap = (
+                            min(v for v in (surplus_num, max_synthetic_num) if v is not None)
+                            if any(v is not None for v in (surplus_num, max_synthetic_num))
+                            else None
+                        )
                         if server_cap is not None and server_cap < max_times:
                             max_times = server_cap
                         material_state_signature = build_material_state_signature(candidate)
@@ -1786,9 +2454,10 @@ def main():
                             entry["plan"] = summarize_synthesis_plan(candidate, max_times)
                             entry["code"] = 0
                             entry["message"] = "Current materials are insufficient for this recipe."
-                            round_entries.append(entry)
+                            cycle_entries.append(entry)
                             continue
 
+                        any_craftable = True
                         available_times = max_times
                         if remaining_target_count is not None:
                             max_times = min(max_times, remaining_target_count)
@@ -1806,7 +2475,7 @@ def main():
                                 "Skipping repeated submit because the material snapshot is unchanged "
                                 "after a previous successful submission."
                             )
-                            round_entries.append(entry)
+                            cycle_entries.append(entry)
                             continue
 
                         payload = build_synthesis_submit_payload(candidate, synthetic_id, max_times)
@@ -1814,11 +2483,17 @@ def main():
                         if parsed.dry_run:
                             entry["code"] = 0
                             entry["submitted"] = False
-                            round_entries.append(entry)
+                            cycle_entries.append(entry)
                             if remaining_target_count is not None:
                                 remaining_target_count -= max_times
+                            cycle_progress = True
                             continue
 
+                        print(
+                            f"[cycle {cycle_no}] submitting synthetic_id={synthetic_id} "
+                            f"syntheticNum={max_times}",
+                            flush=True,
+                        )
                         submit_outcome = submit_synthesis_with_retry(
                             client=client,
                             submit_path=submit_path,
@@ -1834,59 +2509,66 @@ def main():
                         entry["submit_concurrency"] = submit_outcome["concurrency"]
                         entry["code"] = submit_result.get("code", 0 if is_success(submit_result) else 1)
 
-                        # ── GeeTest captcha → confirm step ────────────────────
-                        # submit code=0 means "accepted, pending captcha".
-                        # We must call /confirm with captcha params to actually
-                        # complete the synthesis.  In --captcha-mode=skip we
-                        # skip this step (legacy broken behaviour).
                         confirmed = False
-                        if is_success(submit_result) and parsed.captcha_mode != "skip":
-                            captcha_params, captcha_err = _get_captcha_params(str(synthetic_id))
-                            if captcha_err:
-                                entry["captcha_error"] = captcha_err
-                                entry["code"] = 1
-                            else:
-                                _outer_activity_id = synthetic_id_to_activity_id.get(str(synthetic_id), "")
-                                print(f"[confirm] synthetic_id={synthetic_id}  outer_activity_id={_outer_activity_id!r}  synthetic_num={max_times}")
-                                _confirm_path = confirm_path_template.format(
-                                    uid=uid or "",
-                                    captcha_id=captcha_params.get("captcha_id") or parsed.captcha_id,
-                                    lot_number=captcha_params["lot_number"],
-                                    pass_token=captcha_params["pass_token"],
-                                    gen_time=captcha_params["gen_time"],
-                                    captcha_output=captcha_params["captcha_output"],
-                                )
-                                _confirm_body = {
-                                    "activityId": int(_outer_activity_id) if _outer_activity_id else None,
-                                    "syntheticNum": max_times,
-                                    "syntheticId": int(synthetic_id),
-                                }
-                                print(f"[confirm] body={_confirm_body}")
-                                confirm_result = client.confirm_synthesis(_confirm_path, _confirm_body)
-                                entry["confirm"] = confirm_result
-                                if is_success(confirm_result):
-                                    confirmed = True
-                                    entry["code"] = 0
+                        if is_success(submit_result):
+                            need_slider = synthesis_needs_slider(center_result)
+                            outer_activity_id = resolve_outer_activity_id(
+                                synthetic_id,
+                                synthetic_id_to_activity_id,
+                                candidate,
+                            )
+                            if need_slider:
+                                captcha_params, captcha_err = _get_captcha_params(str(synthetic_id))
+                                if captcha_err:
+                                    entry["captcha_error"] = captcha_err
+                                    entry["code"] = 1
                                 else:
-                                    entry["code"] = (
-                                        confirm_result.get("code", 1)
-                                        if isinstance(confirm_result, dict)
-                                        else 1
+                                    confirm_path = build_synthesis_confirm_path(
+                                        config,
+                                        uid or "",
+                                        captcha_params,
                                     )
+                                    confirm_body = build_synthesis_confirm_body(
+                                        outer_activity_id=outer_activity_id,
+                                        synthetic_id=str(synthetic_id),
+                                        synthetic_num=max_times,
+                                    )
+                                    print(
+                                        f"[confirm] synthetic_id={synthetic_id} needSlider=1 "
+                                        f"activityId={outer_activity_id!r} syntheticNum={max_times}",
+                                        flush=True,
+                                    )
+                                    confirm_result = client.confirm_synthesis(confirm_path, confirm_body)
+                                    entry["confirm"] = confirm_result
+                                    confirmed = is_success(confirm_result)
+                                    entry["code"] = 0 if confirmed else confirm_result.get("code", 1)
+                            else:
+                                confirm_path = build_synthesis_confirm_path(config, uid or "")
+                                confirm_body = build_synthesis_confirm_body(
+                                    outer_activity_id=outer_activity_id,
+                                    synthetic_id=str(synthetic_id),
+                                    synthetic_num=max_times,
+                                )
+                                print(
+                                    f"[confirm] synthetic_id={synthetic_id} needSlider=0 "
+                                    f"activityId={outer_activity_id!r} syntheticNum={max_times}",
+                                    flush=True,
+                                )
+                                confirm_result = client.confirm_synthesis(confirm_path, confirm_body)
+                                entry["confirm"] = confirm_result
+                                confirmed = is_success(confirm_result)
+                                entry["code"] = 0 if confirmed else confirm_result.get("code", 1)
 
-                        round_entries.append(entry)
-                        actually_succeeded = (
-                            (parsed.captcha_mode == "skip" and is_success(submit_result))
-                            or confirmed
-                        )
-                        if actually_succeeded:
-                            round_progress = True
+                        cycle_entries.append(entry)
+
+                        if confirmed:
+                            cycle_progress = True
                             if remaining_target_count is not None:
                                 remaining_target_count -= max_times
                             successful_state_by_synthetic_id[str(synthetic_id)] = material_state_signature
                             successful_submits.append(
                                 {
-                                    "round": round_no,
+                                    "cycle": cycle_no,
                                     "synthetic_id": synthetic_id,
                                     "times": max_times,
                                     "attempt_count": submit_outcome["attempt_count"],
@@ -1896,21 +2578,35 @@ def main():
                                 }
                             )
 
-                    rounds.append({"round": round_no, "entries": round_entries})
-                    if parsed.dry_run or not round_progress:
+                    cycles.append({"cycle": cycle_no, "entries": cycle_entries})
+
+                    if parsed.dry_run:
                         break
+                    if remaining_target_count is not None and remaining_target_count <= 0:
+                        break
+                    if not any_craftable:
+                        print(f"[cycle {cycle_no}] No craftable recipes left, synthesis complete.", flush=True)
+                        break
+                    if cycle_progress:
+                        continue
+                    print(
+                        f"[cycle {cycle_no}] Craftable items remain but submit did not succeed, "
+                        f"retry in {parsed.loop_interval:.1f}s…",
+                        flush=True,
+                    )
+                    time.sleep(max(parsed.loop_interval, 0.1))
 
                 any_discovered_craftable = any(
                     (entry.get("plan") or {}).get("max_times", 0) > 0
-                    for round_info in rounds
-                    for entry in round_info["entries"]
+                    for cycle_info in cycles
+                    for entry in cycle_info["entries"]
                 )
                 return {
                     "code": 0 if parsed.dry_run or successful_submits or not any_discovered_craftable else 1,
-                    "activity_list": activity_list_result,
-                    "activity_details": activity_details,
-                    "synthetic_ids": synthetic_ids,
-                    "rounds": rounds,
+                    "activity_list": last_activity_list_result,
+                    "activity_details": last_activity_details,
+                    "synthetic_ids": last_synthetic_ids,
+                    "cycles": cycles,
                     "target_count": parsed.target_count,
                     "remaining_target_count": remaining_target_count,
                     "submitted_count": len(successful_submits),
@@ -1939,30 +2635,291 @@ def main():
         elif cmd == "market-buy":
             if not uid:
                 raise SystemExit("Error: uid is required for market-buy. Pass --uid or ensure login response contains uid")
-            payload = parse_payload_arg(parsed.payload)
             path = render_command_path(
                 config,
                 "market-buy",
                 "/order-create-service/batch-purchase-consignment-orders?uid={uid}",
                 uid=uid,
             )
-            operation = lambda: client.post(path, payload)
+            collection_name = (parsed.collection_name or "").strip()
+            extra_payload = parse_payload_arg(parsed.payload) or {}
+            if collection_name and parsed.price is not None:
+                group_id = resolve_group_id_for_market(client, collection_name, config)
+                if isinstance(group_id, dict):
+                    operation = lambda: group_id
+                else:
+                    payment_platform = (
+                        parsed.payment_platform
+                        if parsed.payment_platform is not None
+                        else int(get_command_default(config, "market-buy", "payment_platform_code", "30"))
+                    )
+                    payload = build_market_buy_payload(
+                        group_id,
+                        parsed.price,
+                        parsed.quantity,
+                        payment_platform,
+                        extra=extra_payload,
+                    )
+                    print(
+                        f"[market-buy] group_id={group_id} maxSinglePrice={payload['maxSinglePrice']}fen "
+                        f"maxCount={payload['maxCount']}",
+                        flush=True,
+                    )
+                    operation = lambda: client.post(path, payload)
+            else:
+                payload = extra_payload
+                if not payload:
+                    raise SystemExit(
+                        "Error: market-buy requires --collection-name + --price, or --payload"
+                    )
+                operation = lambda: client.post(path, payload)
         elif cmd == "consign-create":
-            payload = parse_payload_arg(parsed.payload)
-            path = render_command_path(
+            consign_path = render_command_path(
                 config,
                 "consign-create",
                 "/order-create-service/consignment-orders",
             )
-            operation = lambda: client.post(path, payload)
-        elif cmd == "consign-cancel":
-            path = render_command_path(
-                config,
-                "consign-cancel",
-                "/order-service/consign-orders/{consign_order_id}/cancel",
-                consign_order_id=parsed.consign_order_id,
+            extra_payload = parse_payload_arg(parsed.payload) or {}
+            payment_platform = (
+                parsed.payment_platform
+                if parsed.payment_platform is not None
+                else int(
+                    get_command_default(config, "consign-create", "payment_platform_code", "30")
+                )
             )
-            operation = lambda: client.post(path)
+
+            def consign_create_operation():
+                group_id = (parsed.group_id or "").strip()
+                collection_name = (parsed.collection_name or "").strip()
+                display_name = collection_name or group_id
+                if not group_id and not collection_name:
+                    return {
+                        "code": 1,
+                        "error": "either --藏品名字 or --group-id is required",
+                    }
+                if not group_id and collection_name:
+                    resolved_id, resolved_display, auth_fail = resolve_group_id_for_consign(
+                        client, collection_name
+                    )
+                    if isinstance(auth_fail, dict) and auth_fail:
+                        return auth_fail
+                    group_id = resolved_id or ""
+                    if resolved_display:
+                        display_name = resolved_display
+                if not group_id:
+                    owned_groups = fetch_owned_collection_groups(client)
+                    hint = ""
+                    if isinstance(owned_groups, list):
+                        suggestions = suggest_owned_collection_names(owned_groups, collection_name)
+                        if suggestions:
+                            hint = " similar owned collections: " + " | ".join(suggestions)
+                        elif owned_groups:
+                            sample = [
+                                collection_group_display_name(g)
+                                for g in owned_groups[:10]
+                                if collection_group_display_name(g)
+                            ]
+                            if sample:
+                                hint = (
+                                    f" (fetched {len(owned_groups)} owned groups; "
+                                    f"examples: {' | '.join(sample)})"
+                                )
+                        else:
+                            hint = " (owned collection group list is empty)"
+                        print(
+                            f"[consign-create] match key={normalize_collection_name(collection_name)!r} "
+                            f"(ignores punctuation/parentheses; keeps Ⅰ-Ⅹ)",
+                            flush=True,
+                        )
+                    return {
+                        "code": 1,
+                        "error": f"no owned collection group matching {collection_name!r}{hint}",
+                        "matchKey": normalize_collection_name(collection_name),
+                    }
+
+                qty = max(1, int(parsed.quantity))
+                item_ids = list_unlocked_digital_collection_ids(client, group_id, limit=qty)
+                if item_ids is None:
+                    return {
+                        "code": 1,
+                        "error": f"failed to list unlocked collections for group {group_id}",
+                    }
+                if len(item_ids) < qty:
+                    return {
+                        "code": 1,
+                        "error": (
+                            f"need {qty} unlocked item(s) to consign, "
+                            f"only {len(item_ids)} available in group {group_id}"
+                        ),
+                        "group_id": group_id,
+                        "available": len(item_ids),
+                    }
+
+                print(
+                    f"[consign-create] group_id={group_id} quantity={qty} "
+                    f"price={parsed.price}yuan paymentPlatformCodes=[{payment_platform}]",
+                    flush=True,
+                )
+                results: list[dict] = []
+                success_count = 0
+                fail_count = 0
+                for index, digital_collection_id in enumerate(item_ids[:qty], start=1):
+                    payload = build_consign_create_payload(
+                        digital_collection_id,
+                        parsed.price,
+                        parsed.consignment_password,
+                        payment_platform_codes=[payment_platform],
+                        extra=extra_payload,
+                    )
+                    print(
+                        f"[consign-create] posting {index}/{qty} "
+                        f"digitalCollectionId={digital_collection_id}",
+                        flush=True,
+                    )
+                    result = client.post(consign_path, payload)
+                    ok = is_success(result)
+                    if ok:
+                        success_count += 1
+                    else:
+                        fail_count += 1
+                        print(
+                            f"[consign-create] failed digitalCollectionId={digital_collection_id}: "
+                            f"code={result.get('code')} message={result.get('message')}",
+                            flush=True,
+                        )
+                    results.append(
+                        {
+                            "digitalCollectionId": digital_collection_id,
+                            "ok": ok,
+                            "result": result,
+                        }
+                    )
+
+                summary = (
+                    f"{display_name}藏品寄售已完成，寄售个数：{success_count}，失败个数：{fail_count}"
+                )
+                print(summary, flush=True)
+                return {
+                    "code": 0 if fail_count == 0 else 1,
+                    "message": summary,
+                    "summary": summary,
+                    "collectionName": display_name,
+                    "successCount": success_count,
+                    "failCount": fail_count,
+                    "group_id": group_id,
+                    "results": results,
+                }
+
+            operation = consign_create_operation
+        elif cmd == "consign-cancel":
+            cancel_password_payload = build_consign_password_fields(parsed.consignment_password)
+
+            def consign_cancel_operation():
+                print("准备开始下架", flush=True)
+                group_id = (parsed.group_id or "").strip()
+                collection_name = (parsed.collection_name or "").strip()
+                display_name = collection_name or group_id
+                if not group_id and collection_name:
+                    resolved_id, resolved_display, auth_fail = resolve_group_id_for_consign(
+                        client, collection_name
+                    )
+                    if isinstance(auth_fail, dict) and auth_fail:
+                        return auth_fail
+                    group_id = resolved_id or ""
+                    if resolved_display:
+                        display_name = resolved_display
+                if not group_id:
+                    owned_groups = fetch_owned_collection_groups(client)
+                    hint = ""
+                    if isinstance(owned_groups, list):
+                        suggestions = suggest_owned_collection_names(owned_groups, collection_name)
+                        if suggestions:
+                            hint = " similar owned collections: " + " | ".join(suggestions)
+                    return {
+                        "code": 1,
+                        "error": f"no owned collection group matching {collection_name!r}{hint}",
+                        "matchKey": normalize_collection_name(collection_name),
+                    }
+
+                cancel_qty = max(1, int(parsed.quantity))
+                cancel_price = parsed.price
+                listed = list_consigned_orders_for_cancel(
+                    client,
+                    group_id,
+                    price_yuan=cancel_price,
+                    limit=cancel_qty,
+                )
+                if listed is None:
+                    return {
+                        "code": 1,
+                        "error": f"failed to list consigned items for group {group_id}",
+                    }
+                consigned, total_matched = listed
+                if not consigned:
+                    hint = f" (group_id={group_id})"
+                    if cancel_price is not None:
+                        hint += f", no listings at {cancel_price} yuan"
+                    if total_matched > 0:
+                        hint += f", matched {total_matched} but quantity filter left none"
+                    return {
+                        "code": 1,
+                        "error": f"no active consignment listings for {display_name!r}{hint}",
+                        "group_id": group_id,
+                        "matched": total_matched,
+                    }
+
+                print(
+                    f"[consign-cancel] group_id={group_id} to cancel={len(consigned)} "
+                    f"(price={cancel_price}yuan, quantity={cancel_qty}"
+                    + (f", matched={total_matched}" if total_matched != len(consigned) else "")
+                    + ")",
+                    flush=True,
+                )
+                results: list[dict] = []
+                success_count = 0
+                fail_count = 0
+                for index, entry in enumerate(consigned, start=1):
+                    consign_order_id = entry["consign_order_id"]
+                    cancel_path = render_command_path(
+                        config,
+                        "consign-cancel",
+                        "/order-service/consign-orders/{consign_order_id}/cancel",
+                        consign_order_id=consign_order_id,
+                    )
+                    print(
+                        f"[consign-cancel] cancel {index}/{len(consigned)} "
+                        f"consignOrderId={consign_order_id}",
+                        flush=True,
+                    )
+                    result = client.post(cancel_path, cancel_password_payload)
+                    ok = is_success(result)
+                    if ok:
+                        success_count += 1
+                    else:
+                        fail_count += 1
+                        print(
+                            f"[consign-cancel] failed consignOrderId={consign_order_id}: "
+                            f"code={result.get('code')} message={result.get('message')}",
+                            flush=True,
+                        )
+                    results.append({"consign_order_id": consign_order_id, "ok": ok, "result": result})
+
+                summary = (
+                    f"{display_name}藏品下架已完成，下架个数：{success_count}，失败个数：{fail_count}"
+                )
+                print(summary, flush=True)
+                return {
+                    "code": 0 if fail_count == 0 else 1,
+                    "message": summary,
+                    "summary": summary,
+                    "collectionName": display_name,
+                    "successCount": success_count,
+                    "failCount": fail_count,
+                    "group_id": group_id,
+                    "results": results,
+                }
+
+            operation = consign_cancel_operation
         elif cmd == "purchase-detail":
             path = render_command_path(
                 config,

@@ -19,6 +19,7 @@ from __future__ import annotations
 import json
 import socket
 import subprocess
+import threading
 import time
 import uuid
 
@@ -55,6 +56,7 @@ class RPCConnection:
         self.port = port
         self._sock: socket.socket | None = None
         self._file = None
+        self._lock = threading.Lock()
 
     def connect(self, retry: int = 10, delay: float = 1.0):
         for i in range(retry):
@@ -83,18 +85,20 @@ class RPCConnection:
         raise ConnectionRefusedError(tip)
 
     def call(self, cmd: dict, timeout: float = 10.0) -> dict:
-        global _id_counter
-        _id_counter += 1
-        cmd["id"] = _id_counter
+        with self._lock:
+            global _id_counter
+            _id_counter += 1
+            cmd = dict(cmd)
+            cmd["id"] = _id_counter
 
-        line = json.dumps(cmd, ensure_ascii=False) + "\n"
-        self._sock.settimeout(timeout)
-        self._sock.sendall(line.encode("utf-8"))
+            line = json.dumps(cmd, ensure_ascii=False) + "\n"
+            self._sock.settimeout(timeout)
+            self._sock.sendall(line.encode("utf-8"))
 
-        resp_line = self._file.readline()
-        if not resp_line:
-            raise ConnectionError("Bridge closed connection")
-        return json.loads(resp_line.strip())
+            resp_line = self._file.readline()
+            if not resp_line:
+                raise ConnectionError("Bridge closed connection")
+            return json.loads(resp_line.strip())
 
     def ping(self) -> bool:
         try:

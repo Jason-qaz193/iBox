@@ -245,8 +245,10 @@ POST /order-create-service/batch-purchase-consignment-orders?uid=...
 ### 5. 创建挂单
 
 ```bash
-python run.py consign-create 13800138000 123456 --payload @payload.json
+python run.py consign-create 13800138000 123456 --支付密码 123456 --藏品名字 "藏品名" --出售价格 99 --出售数量 1
 ```
+
+脚本会按 `--藏品名字` 匹配「我的藏品」分组，自动选取未锁定的藏品并逐个提交寄售。
 
 对应接口：
 
@@ -257,8 +259,10 @@ POST /order-create-service/consignment-orders
 ### 6. 取消挂单
 
 ```bash
-python run.py consign-cancel 13800138000 123456 112333806
+python run.py consign-cancel 13800138000 123456 --支付密码 123456 --藏品名字 "藏品名" --下架价格 99 --下架数量 1
 ```
+
+脚本会按 `--藏品名字` 匹配分组，查找指定 `--下架价格` 的寄售单，并按 `--下架数量` 逐个取消。
 
 对应接口：
 
@@ -280,13 +284,13 @@ python run.py synthesis-auto 13800138000 123456
 
 这个命令会：
 
-- 先请求 `synthesis-activity-list`
-- 再请求每个活动的 `synthesis-activity-detail`
-- 从活动详情里找出所有 `synthetic_id`
-- 逐个请求 `synthesis-center/{synthetic_id}`
-- 计算当前库存下每个配方最多能合成多少次
-- 把当前能合成的都提交掉
-- 每轮提交后再重新扫一遍，直到没有任何一项还能继续合成
+- 循环拉取最新的 `synthesis-activity-list`
+- 并发请求每个活动的 `synthesis-activity-detail`（`--scan-concurrency`）
+- 从活动详情里找出所有当前可参与的 `synthetic_id`
+- 并发请求 `synthesis-center/{synthetic_id}` 校验材料是否满足
+- 材料够就提交合成；不传 `--target-count` 时默认按当前库存全部合成
+- 每轮提交成功后立即重新扫描最新活动，直到材料用尽或达到 `--target-count`
+- `submit` 成功后还会调用 `confirm` 才会真正消耗材料；`needSlider=0` 的活动无需滑块，直接 confirm
 
 如果你想先只看脚本识别出来的方案，不真正提交：
 
@@ -306,6 +310,13 @@ python run.py synthesis-auto 13800138000 - --submit-window 60 --submit-concurren
 python run.py synthesis-auto 13800138000 - --target-count 3
 ```
 
+常用参数：
+
+- `--scan-concurrency 4`：并发拉取活动详情和 synthesis-center（默认 4）
+- `--loop-interval 2`：活动尚未开始或暂时无法提交时，隔多少秒重新扫描（默认 2）
+- `--max-rounds 0`：扫描轮数上限，0 表示不限（默认 0，直到合成结束或达到 `--target-count`）
+- `--target-count` / `--expected-count`：限制本次最多提交的 `syntheticNum` 总数，不传则尽量全部合成
+
 注意：
 
 - 当前默认就是按活动列表接口返回的“当前活动”去扫，不额外暴露翻页参数
@@ -315,8 +326,6 @@ python run.py synthesis-auto 13800138000 - --target-count 3
 - 单次提交失败后会在 `--submit-window` 指定的时间窗口内持续重试
 - `--retry-interval` 是这个窗口内两次尝试之间的短间隔，默认 0.3 秒
 - `--submit-concurrency` 可以让同一个合成项在窗口内用小并发持续抢，任一成功就会收敛停止
-- `--target-count` / `--expected-count` 可以限制本次最多提交的 `syntheticNum` 总数，不传则保持原来的“能合成多少就提交多少”
-- 当前命令只负责 `submit`，如果该活动后面还需要验证码确认，仍然继续用 `synthesis-confirm`
 
 ### 9. 查看公开求购详情
 
@@ -376,17 +385,13 @@ python run.py api 13800138000 123456 POST /order-service/xxx --payload '{"a":1}'
 
 支持两种方式。
 
-直接传 JSON 字符串：
+创建挂单示例：
 
 ```bash
-python run.py consign-create 13800138000 123456 --cid your_cid --payload '{"foo":"bar"}'
+python run.py consign-create 13800138000 123456 --支付密码 123456 --藏品名字 "藏品名" --出售价格 99 --出售数量 1
 ```
 
-或者传 JSON 文件：
-
-```bash
-python run.py consign-create 13800138000 123456 --cid your_cid --payload @payload.json
-```
+如需额外字段，仍可用 `--payload @payload.json` 合并进请求体。
 
 例如：
 
@@ -426,8 +431,8 @@ python run.py consign-create 13800138000 123456 --cid your_cid --payload @payloa
 5. `python run.py market-list ...`
 6. `python run.py purchase-orders ...`
 7. 准备某个写操作的 `payload.json`
-8. `python run.py consign-create ... --payload @payload.json`
-9. `python run.py consign-cancel ...`
+8. `python run.py consign-create ... --支付密码 ... --藏品名字 "..." --出售价格 ... --出售数量 ...`
+9. `python run.py consign-cancel ... --支付密码 ... --藏品名字 "..." --下架价格 ... --下架数量 ...`
 10. `python run.py wanted-deal ... --collection-name "藏品名" --min-price 99 --consignment-password 123456`
 
 ## 目前和“token 持久化复用”相比的差异
@@ -449,6 +454,66 @@ python run.py consign-create 13800138000 123456 --cid your_cid --payload @payloa
 - 是否还依赖其他登录态字段
 - token 过期后的错误码
 
+## QQ 机器人（OneBot）
+
+可通过 QQ 私聊/群聊发送指令，间接调用 `run.py`。
+
+### 1. 准备 OneBot
+
+推荐使用 [NapCat](https://napcat.napneko.icu/) 或 Lagrange.OneBot，开启 OneBot v11 的 HTTP + 正向 WebSocket。
+
+默认地址一般是：
+
+- HTTP: `http://127.0.0.1:3000`
+- WS: `ws://127.0.0.1:3001`
+
+### 2. 配置机器人
+
+```bash
+cp config/qq_bot.example.yaml config/qq_bot.yaml
+pip install websockets
+```
+
+编辑 `config/qq_bot.yaml`：
+
+- `bot_qq`：NapCat 登录的机器人 QQ 号（用户发消息给这个号）
+- `allow_all_senders: true`：任何用户私聊 `bot_qq` 都可执行指令
+- `allowed_users`：仅当 `allow_all_senders: false` 时，限制可发指令的 QQ 号
+- `access_token`：与 OneBot 配置一致（如有）
+- `default_mobile` / `default_pay_password`：可省略命令里的手机号/密码
+- `run_args`：传给 `run.py` 的额外参数，例如 `["--usb"]`
+
+### 3. 启动
+
+```bash
+python qq_bot.py
+```
+
+### 4. 支持的 QQ 指令
+
+```text
+帮助
+验证码 13800138000
+登录 13800138000 123456
+寄售 13800138000 - 123456 藏品名 99 1
+下架 13800138000 - 123456 藏品名 99 1
+求购 13800138000 - 123456 藏品名 88 1
+捡漏 13800138000 - 藏品名 5000 1
+```
+
+若已在 `qq_bot.yaml` 配置默认手机号和支付密码，可简写：
+
+```text
+寄售 - 藏品名 99 1
+下架 - 藏品名 99 1
+```
+
+说明：
+
+- `-` 表示复用 `config/session.json` 里该手机号的 session
+- 藏品名含空格时用引号：`寄售 - 123456 "2026喜糖熊猫" 199 1`
+- 支付密码会出现在 QQ 聊天记录中；若 `allow_all_senders: true`，任何私聊机器人的人都能操作，请谨慎使用
+
 ## 关键文件
 
 | 文件 | 作用 |
@@ -456,7 +521,9 @@ python run.py consign-create 13800138000 123456 --cid your_cid --payload @payloa
 | [run.py](/Users/neatli/code/ibox/run.py) | 命令行入口 |
 | [src/frida_client.py](/Users/neatli/code/ibox/src/frida_client.py) | RPC 客户端，负责登录后携带 token 调接口 |
 | [frida/rpc_bridge.js](/Users/neatli/code/ibox/frida/rpc_bridge.js) | 注入 App 内部执行加解密 |
-| [config/config.example.yaml](/Users/neatli/code/ibox/config/config.example.yaml) | 配置模板 |
+| [config/config.example.yaml](/Users/neatli/code/ibox/config/config.example.yaml) | iBox 配置模板 |
+| [qq_bot.py](/Users/neatli/code/ibox/qq_bot.py) | QQ OneBot 指令桥接 |
+| [config/qq_bot.example.yaml](/Users/neatli/code/ibox/config/qq_bot.example.yaml) | QQ 机器人配置模板 |
 
 ## 当前限制
 

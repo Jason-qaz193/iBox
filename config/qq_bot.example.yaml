@@ -1,0 +1,32 @@
+# Copy to config/qq_bot.yaml and fill in. Do not commit config/qq_bot.yaml.
+
+# OneBot v11 (NapCat / Lagrange.OneBot / LLOneBot)
+onebot_http_url: "http://127.0.0.1:3000"
+onebot_ws_url: "ws://127.0.0.1:3001"
+access_token: ""
+
+# NapCat 登录的机器人 QQ 号（用户发消息给这个号即可触发指令）
+bot_qq: 3691107632
+
+# true = 任何用户私聊 bot_qq 都可执行指令（推荐：多人共用一个机器人入口）
+# false = 仅 allowed_users 列表中的 QQ 号可发指令
+allow_all_senders: true
+
+# 仅当 allow_all_senders: false 时生效
+allowed_users:
+  - 3691107632
+
+# 群聊白名单（留空 = 不处理群消息；填群号则该群内任意成员可发指令）
+allowed_groups: []
+
+# 默认值，可省略命令里的手机号/验证码/支付密码（按需填写）
+default_mobile: "18935209286"
+default_code: "-"
+default_pay_password: ""
+
+# 传给 run.py 的额外参数（与 config.yaml 里 USB 模式一致）
+run_args:
+  - "--usb"
+
+# 单条指令最长执行时间（秒）
+command_timeout: 600

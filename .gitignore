@@ -1,4 +1,5 @@
 config/config.yaml
+config/qq_bot.yaml
 config/session.json
 config/current_key.txt
 __pycache__/
