@@ -8,8 +8,9 @@ websockets>=12.0
 # ── GeeTest V4 自动过验证码（可选）────────────────────────────────────────────
 # synthesis-auto --captcha-mode=auto 需要以下依赖：
 #   conda activate ibox
-#   pip install playwright Pillow numpy
-#   playwright install chromium
+#   pip install playwright Pillow numpy opencv-python-headless
 playwright>=1.40
 Pillow>=9.0
 numpy>=1.21
+opencv-python-headless>=4.8
+# ddddocr>=1.4  # optional OCR fallback (requires working onnxruntime)

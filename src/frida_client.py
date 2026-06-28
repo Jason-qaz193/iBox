@@ -413,6 +413,24 @@ class IBoxRPCClient:
 
 # ── GeeTest captcha polling ───────────────────────────────────────────────────
 
+def peek_rpc_captcha(device_host: str = RPC_HOST) -> dict | None:
+    """Return the latest App-captured captcha immediately, without waiting."""
+    try:
+        resp = rpc({"type": "captcha-latest"}, device_host=device_host, timeout=5.0)
+        lot = resp.get("lot_number")
+        if resp.get("ok") and lot not in (None, ""):
+            return {
+                "lot_number": str(lot),
+                "pass_token": str(resp.get("pass_token", "")),
+                "gen_time": str(resp.get("gen_time", "")),
+                "captcha_output": str(resp.get("captcha_output", "")),
+                "captcha_id": str(resp.get("captcha_id", "")),
+            }
+    except Exception:
+        pass
+    return None
+
+
 def poll_captcha(
     device_host: str = RPC_HOST,
     timeout: float = 120.0,

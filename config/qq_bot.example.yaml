@@ -28,5 +28,20 @@ default_pay_password: ""
 run_args:
   - "--usb"
 
-# 单条指令最长执行时间（秒）
-command_timeout: 600
+# 单条指令最长执行时间（秒）；0 = 不限制（捡漏/合成等长任务可一直运行）
+command_timeout: 0
+
+# 同时运行的任务数上限；0 或不填 = 不限制（不同账号可并行）
+max_concurrent_tasks: 0
+
+# 点对点全自动：B 寄售后自动触发 A 购买（按寄售ID|藏品ID 批量直购）
+# 键为卖家手机号；也可写成列表形式（见注释）
+# p2p_auto:
+#   "19965260715":
+#     buyer_mobile: "13800138000"
+#     buyer_code: "-"
+#     buyer_pay_password: "123456"
+# p2p_auto:
+#   - seller: "19965260715"
+#     buyer_mobile: "13800138000"
+#     buyer_pay_password: "123456"

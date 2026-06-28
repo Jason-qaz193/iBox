@@ -208,7 +208,24 @@ def build_parser(config: dict | None = None) -> argparse.ArgumentParser:
         "--loop-interval",
         type=float,
         default=2.0,
-        help="Seconds to wait before re-scanning when activities are not ready yet (default: 2)",
+        help="Seconds between scans while craftable activities exist (default: 2)",
+    )
+    synthesis_auto.add_argument(
+        "--idle-interval",
+        type=float,
+        default=30.0,
+        help="Seconds to wait when nothing is craftable and no activity is opening soon (default: 30)",
+    )
+    synthesis_auto.add_argument(
+        "--far-interval",
+        type=float,
+        default=90.0,
+        help="Max seconds between scans when the next activity is still far away (default: 90)",
+    )
+    synthesis_auto.add_argument(
+        "--once",
+        action="store_true",
+        help="Exit after target count or no craftable recipes (default: keep running until stopped)",
     )
     synthesis_auto.add_argument(
         "--detail-interval",
@@ -261,11 +278,20 @@ def build_parser(config: dict | None = None) -> argparse.ArgumentParser:
     synthesis_confirm.add_argument("--captcha-output", required=True)
     add_payload_arg(synthesis_confirm, required=False)
 
-    market_buy = subparsers.add_parser("market-buy", help="Create batch purchase-consignment order")
+    market_buy = subparsers.add_parser(
+        "market-buy",
+        help="Scan market and buy consignment listings at or below max unit price",
+    )
     add_auth_args(market_buy)
     market_buy.add_argument("--collection-name", dest="collection_name", default="", help="藏品名称")
     market_buy.add_argument("--price", dest="price", type=float, default=None, help="最高单价（元）")
     market_buy.add_argument("--quantity", dest="quantity", type=positive_int, default=1, help="购买数量 (default: 1)")
+    market_buy.add_argument(
+        "--支付密码",
+        dest="consignment_password",
+        default="",
+        help="支付密码",
+    )
     market_buy.add_argument(
         "--payment-platform",
         dest="payment_platform",
@@ -273,7 +299,75 @@ def build_parser(config: dict | None = None) -> argparse.ArgumentParser:
         default=None,
         help="支付平台代码 (default: 30)",
     )
+    market_buy.add_argument(
+        "--list-pages",
+        dest="list_pages",
+        type=positive_int,
+        default=10,
+        help="每轮扫描市场挂单的最大页数 (default: 10)",
+    )
+    market_buy.add_argument(
+        "--poll-interval",
+        dest="poll_interval",
+        type=float,
+        default=None,
+        help="无符合条件挂单时的重试间隔秒数 (default: 2)",
+    )
     add_payload_arg(market_buy, required=False)
+
+    market_purchase = subparsers.add_parser(
+        "market-purchase",
+        help="Buy consignment listings at an exact price (optionally from a specific seller)",
+    )
+    add_auth_args(market_purchase)
+    market_purchase.add_argument("--collection-name", dest="collection_name", default="", help="藏品名称")
+    market_purchase.add_argument("--price", dest="price", type=float, required=True, help="购买单价（元，精确匹配）")
+    market_purchase.add_argument(
+        "--quantity",
+        dest="quantity",
+        type=positive_int,
+        default=1,
+        help="购买数量 (default: 1)",
+    )
+    market_purchase.add_argument(
+        "--支付密码",
+        dest="consignment_password",
+        default="",
+        help="支付密码",
+    )
+    market_purchase.add_argument(
+        "--seller-uid",
+        dest="seller_uid",
+        default="",
+        help="卖家 userId/uid（点对点购买时指定 B 用户）",
+    )
+    market_purchase.add_argument(
+        "--consign-order-id",
+        dest="consign_order_id",
+        default="",
+        help="指定寄售单 ID（orderId|藏品ID；多个用 、 或逗号分隔，批量直购）",
+    )
+    market_purchase.add_argument(
+        "--digital-collection-id",
+        dest="digital_collection_id",
+        default="",
+        help="指定藏品 digitalCollectionId（直购必填，可与寄售单 ID 一起传）",
+    )
+    market_purchase.add_argument(
+        "--list-pages",
+        dest="list_pages",
+        type=positive_int,
+        default=10,
+        help="扫描市场挂单的最大页数 (default: 10)",
+    )
+    market_purchase.add_argument(
+        "--payment-platform",
+        dest="payment_platform",
+        type=int,
+        default=None,
+        help="支付平台代码 (default: 30)",
+    )
+    add_payload_arg(market_purchase, required=False)
 
     consign_create = subparsers.add_parser(
         "consign-create",
@@ -360,8 +454,8 @@ def build_parser(config: dict | None = None) -> argparse.ArgumentParser:
     wanted_deal = subparsers.add_parser(
         "wanted-deal",
         help=(
-            "Deal a wanted/purchase order relation. "
-            "Pass purchase_order_id+relation_id directly, or use --collection-name to look them up automatically."
+            "Sell to market buy orders (求购成交). "
+            "Scan purchase orders at or above --min-price until --quantity deals complete."
         ),
     )
     add_auth_args(wanted_deal)
@@ -375,6 +469,20 @@ def build_parser(config: dict | None = None) -> argparse.ArgumentParser:
     wanted_deal.add_argument("--collection-id", dest="collection_id", default="", help="要卖出的具体藏品ID — auto-selects an unlocked item when omitted")
     wanted_deal.add_argument("--payment-platform", dest="payment_platform", type=int, default=30, help="支付钱包平台代码 (default: 30)")
     wanted_deal.add_argument("--po-page-size", dest="po_page_size", type=int, default=20, help="Page size when listing purchase orders for name lookup (default: 20)")
+    wanted_deal.add_argument(
+        "--po-max-pages",
+        dest="po_max_pages",
+        type=int,
+        default=5,
+        help="Max pages to scan per group when listing purchase orders (default: 5)",
+    )
+    wanted_deal.add_argument(
+        "--poll-interval",
+        dest="poll_interval",
+        type=float,
+        default=None,
+        help="轮询间隔（秒）：无符合条件求购单或本轮未成交时等待后再扫描（默认 10）",
+    )
     wanted_deal.add_argument("--market-search-pages", dest="market_search_pages", type=int, default=10, help="How many public market pages to scan by collection name (default: 10)")
     wanted_deal.add_argument("--market-segment-id", dest="market_segment_id", default="-1", help="Public market segmentId to search (default: -1)")
     wanted_deal.add_argument("--dry-run", action="store_true", help="Print matched orders without executing the deal (only in name-lookup mode)")
@@ -389,10 +497,97 @@ def build_parser(config: dict | None = None) -> argparse.ArgumentParser:
     wanted_buy.add_argument("--collection-name", dest="collection_name", default="", help="藏品名称 — auto-lookup group_id by name")
     wanted_buy.add_argument("--price", dest="price", type=float, required=True, help="出价（元）")
     wanted_buy.add_argument("--quantity", dest="quantity", type=int, default=1, help="求购数量 (default: 1)")
-    wanted_buy.add_argument("--payment-platform", dest="payment_platform", type=int, default=25, help="支付平台代码 (default: 25)")
-    wanted_buy.add_argument("--consignment-password", dest="consignment_password", default="", help="寄售密码")
+    wanted_buy.add_argument("--payment-platform", dest="payment_platform", type=int, default=30, help="支付平台代码 (default: 30，汇付钱包)")
+    wanted_buy.add_argument(
+        "--支付密码",
+        dest="consignment_password",
+        default="",
+        help="寄售/支付密码",
+    )
+    wanted_buy.add_argument("--consignment-password", dest="consignment_password", default="", help="寄售密码（同 --支付密码）")
     wanted_buy.add_argument("--dry-run", action="store_true", help="Print resolved group_id without placing order")
     add_payload_arg(wanted_buy, required=False)
+
+    sale_rush = subparsers.add_parser(
+        "sale-rush",
+        help="First-sale / priority purchase (首发抢购): POST /order-create-service/sales/{sale_id}/orders",
+    )
+    add_auth_args(sale_rush)
+    sale_rush.add_argument("--sale-id", dest="sale_id", default="", help="首发活动 ID（如 369）")
+    sale_rush.add_argument("--group-id", dest="group_id", default="", help="藏品分组 ID")
+    sale_rush.add_argument("--collection-name", dest="collection_name", default="", help="藏品名称（自动查 group 与 sale-info）")
+    sale_rush.add_argument("--quantity", dest="quantity", type=positive_int, default=1, help="购买数量 num (default: 1)")
+    sale_rush.add_argument(
+        "--payment-platform",
+        dest="payment_platform",
+        type=int,
+        default=None,
+        help="支付平台代码 (default: 30)",
+    )
+    sale_rush.add_argument(
+        "--支付密码",
+        dest="consignment_password",
+        default="",
+        help="支付密码（钱包扣款）",
+    )
+    sale_rush.add_argument(
+        "--consignment-password",
+        dest="consignment_password",
+        default="",
+        help="支付密码（同 --支付密码）",
+    )
+    sale_rush.add_argument(
+        "--no-wait",
+        dest="wait_for_start",
+        action="store_false",
+        help="不等待 onSaleTime，立即尝试下单",
+    )
+    sale_rush.set_defaults(wait_for_start=True)
+    sale_rush.add_argument(
+        "--retry-window",
+        type=float,
+        default=30.0,
+        help="开售后创建订单的重试窗口（秒，default: 30）",
+    )
+    sale_rush.add_argument(
+        "--retry-interval",
+        type=float,
+        default=0.2,
+        help="创建订单失败后的重试间隔（秒，default: 0.2）",
+    )
+    sale_rush.add_argument(
+        "--captcha-mode",
+        choices=["app", "auto", "playwright", "manual", "skip"],
+        default="auto",
+        help="验证码：auto=Playwright 自动(语序点选/滑块)→失败再等 App；"
+        "playwright=仅浏览器；app/manual=仅 App 内完成(RPC 捕获)",
+    )
+    sale_rush.add_argument(
+        "--captcha-timeout",
+        type=float,
+        default=120.0,
+        help="等待验证码的最长时间（秒）",
+    )
+    sale_rush.add_argument(
+        "--captcha-id",
+        default="0d4b08eac1cbdcad36bbf607c5bf3e1b",
+        help="GeeTest captcha_id",
+    )
+    sale_rush.add_argument(
+        "--captcha-headed",
+        dest="captcha_headed",
+        action="store_true",
+        help="Playwright 解验证码时显示浏览器窗口（语序点选成功率更高）",
+    )
+    sale_rush.add_argument(
+        "--captcha-headless",
+        dest="captcha_headed",
+        action="store_false",
+        help="Playwright 使用无头模式（语序点选可能失败）",
+    )
+    sale_rush.set_defaults(captcha_headed=True)
+    sale_rush.add_argument("--dry-run", action="store_true", help="仅解析活动信息，不下单")
+    add_payload_arg(sale_rush, required=False)
 
     api_parser = subparsers.add_parser("api", help="Call an arbitrary authenticated iBox API path in RPC mode")
     add_auth_args(api_parser)
@@ -617,17 +812,76 @@ _OWNED_COLLECTION_ID_KEYS = (
 )
 
 
+_COLLECTION_NAME_KEEP_CHARS = (
+    r"\u4E00-\u9FFF"  # CJK Unified Ideographs
+    r"\u3400-\u4DBF"  # CJK Extension A
+    r"\uF900-\uFAFF"  # CJK Compatibility Ideographs
+    r"A-Za-z0-9"
+    r"\u2160-\u217F"  # Ⅰ Ⅱ Ⅲ … roman numerals
+    r"\uFF10-\uFF19"  # fullwidth digits
+)
+_FULLWIDTH_DIGIT_MAP = str.maketrans("０１２３４５６７８９", "0123456789")
+_UNICODE_ROMAN_CHARS = "ⅠⅡⅢⅣⅤⅥⅦⅧⅨⅩⅪⅫⅰⅱⅲⅳⅴⅵⅶⅷⅸⅹⅺⅻ"
+_ASCII_ROMAN_NUMERALS = (
+    "i",
+    "ii",
+    "iii",
+    "iv",
+    "v",
+    "vi",
+    "vii",
+    "viii",
+    "ix",
+    "x",
+    "xi",
+    "xii",
+)
+_UNICODE_ROMAN_TO_ASCII = dict(zip(_UNICODE_ROMAN_CHARS, _ASCII_ROMAN_NUMERALS * 2))
+_TRAILING_ROMAN_SUFFIX_RE = re.compile(r"(i|ii|iii|iv|v|vi|vii|viii|ix|x|xi|xii)$")
+
+
+def trailing_roman_suffix(normalized_name: str) -> str | None:
+    match = _TRAILING_ROMAN_SUFFIX_RE.search(normalized_name or "")
+    return match.group(1) if match else None
+
+
+def report_task_progress(done: int, total: int) -> None:
+    """Emit a machine-readable progress line for QQ bot / log consumers."""
+    print(f"[ibox-progress] {int(done)}/{int(total)}", flush=True)
+
+
 def normalize_collection_name(name: str | None) -> str:
-    """Match keys for collection names; ignore punctuation and spaces."""
+    """Strip punctuation/symbols; keep Chinese, English, digits and roman numerals (ⅠⅡⅢ)."""
     if name is None:
         return ""
     normalized = str(name).strip()
-    normalized = re.sub(
-        r"[^\u4E00-\u9FFF\u3400-\u4DBF\uF900-\uFAFFA-Za-z0-9\u2160-\u2169]+",
-        "",
-        normalized,
-    )
-    return normalized.lower()
+    normalized = re.sub(rf"[^{_COLLECTION_NAME_KEEP_CHARS}]+", "", normalized)
+    normalized = normalized.translate(_FULLWIDTH_DIGIT_MAP)
+    normalized = normalized.lower()
+    for uchar, ascii_roman in _UNICODE_ROMAN_TO_ASCII.items():
+        normalized = normalized.replace(uchar, ascii_roman)
+    return normalized
+
+
+def collection_name_matches(query: str, candidate: str) -> bool:
+    normalized_query = normalize_collection_name(query)
+    normalized_candidate = normalize_collection_name(candidate)
+    if normalized_query and normalized_candidate:
+        query_roman = trailing_roman_suffix(normalized_query)
+        candidate_roman = trailing_roman_suffix(normalized_candidate)
+        if query_roman and query_roman != candidate_roman:
+            return False
+        if candidate_roman and not query_roman and normalized_query != normalized_candidate:
+            return False
+        return (
+            normalized_query in normalized_candidate
+            or normalized_candidate in normalized_query
+        )
+    raw_query = str(query or "").strip()
+    raw_candidate = str(candidate or "").strip()
+    if not raw_query:
+        return False
+    return raw_query in raw_candidate
 
 
 def collection_group_display_name(group: dict) -> str:
@@ -646,17 +900,15 @@ def _match_collection_groups(groups_list: list, collection_name: str) -> list[di
         return [
             g
             for g in groups_list
-            if isinstance(g, dict) and collection_name in collection_group_display_name(g)
+            if isinstance(g, dict) and collection_name_matches(collection_name, collection_group_display_name(g))
         ]
 
     matched: list[dict] = []
     for group in groups_list:
         if not isinstance(group, dict):
             continue
-        normalized_name = normalize_collection_name(collection_group_display_name(group))
-        if not normalized_name:
-            continue
-        if normalized_target in normalized_name or normalized_name in normalized_target:
+        display_name = collection_group_display_name(group)
+        if collection_name_matches(collection_name, display_name):
             matched.append(group)
 
     exact = [
@@ -787,9 +1039,9 @@ def resolve_group_id_by_public_market(
             if not name:
                 continue
             if normalized_target:
-                if normalized_target not in normalize_collection_name(str(name)):
+                if not collection_name_matches(collection_name, str(name)):
                     continue
-            elif collection_name not in str(name):
+            elif not collection_name_matches(collection_name, str(name)):
                 continue
             gid = first_present(item, ("id", "groupId", "collectionGroupId", "digitalCollectionGroupId"))
             if gid in (None, "") or str(gid) in seen:
@@ -830,13 +1082,33 @@ def resolve_group_id_for_consign(
     if isinstance(public, dict):
         return "", "", public
     if public:
-        owned_items = list_unlocked_digital_collection_ids(client, public, limit=1)
+        owned_items, list_err = list_unlocked_digital_collection_ids(client, public, limit=1)
         if owned_items:
             print(
                 f"[consign-create] resolved via public market (owned items found): group_id={public}",
                 flush=True,
             )
             return public, collection_name, None
+        if isinstance(list_err, dict):
+            code = list_err.get("code")
+            msg = list_err.get("message") or list_err.get("error")
+            detail = f" (API code={code} message={msg})" if code not in (None, "") or msg else ""
+            return "", "", {
+                "code": 1,
+                "error": (
+                    f"found {collection_name!r} on market (group_id={public}) "
+                    f"but failed to list your unlocked items{detail}"
+                ),
+                "group_id": public,
+            }
+        return "", "", {
+            "code": 1,
+            "error": (
+                f"found {collection_name!r} on market (group_id={public}) "
+                f"but you do not own any unlocked items to consign"
+            ),
+            "group_id": public,
+        }
 
     return "", "", None
 
@@ -888,16 +1160,837 @@ def build_market_buy_payload(
     return payload
 
 
+def market_listing_price_fen(item: dict) -> int | None:
+    return to_price_fen(
+        first_present(item, ("price", "salePrice", "consignmentPrice", "singlePrice", "maxSinglePrice"))
+    )
+
+
+def market_listing_seller_uid(item: dict) -> str:
+    return str(
+        first_present(
+            item,
+            ("userId", "sellerUserId", "sellerId", "ownerUserId", "uid", "sellerUid", "publishUserId"),
+        )
+        or ""
+    ).strip()
+
+
+def extract_consign_order_id_from_result(result: dict | None) -> str | None:
+    if not isinstance(result, dict):
+        return None
+    data = result.get("data")
+    if isinstance(data, dict):
+        value = first_present(
+            data,
+            ("consignOrderId", "consignmentOrderId", "consignmentOrderNo", "orderId", "id"),
+        )
+        if value not in (None, ""):
+            return str(value)
+    value = first_present(
+        result,
+        ("consignOrderId", "consignmentOrderId", "consignmentOrderNo", "orderId", "id"),
+    )
+    if value not in (None, ""):
+        return str(value)
+    return None
+
+
+def owned_item_digital_collection_id(item: dict) -> str:
+    value = first_present(
+        item,
+        ("digitalCollectionId", "collectionId", "digitalCollectionID", "collectionID"),
+    )
+    if value not in (None, ""):
+        return str(value).strip()
+    digital_collection = item.get("digitalCollection")
+    if isinstance(digital_collection, dict):
+        nested = digital_collection.get("id")
+        if nested not in (None, ""):
+            return str(nested).strip()
+    return ""
+
+
+def extract_consign_item_ids(item: dict) -> dict:
+    digital_collection_id = owned_item_digital_collection_id(item)
+    order_uuid = str(first_present(item, ("orderId", "orderUuid")) or "").strip()
+    numeric_market_id = ""
+    for key in ("consignmentOrderId", "consignOrderId", "marketOrderId"):
+        value = item.get(key)
+        if value not in (None, "") and str(value).lstrip("-").isdigit():
+            numeric_market_id = str(value).strip()
+            break
+    raw_id = item.get("id")
+    if (
+        numeric_market_id == ""
+        and raw_id not in (None, "")
+        and str(raw_id).lstrip("-").isdigit()
+        and str(raw_id) != digital_collection_id
+    ):
+        numeric_market_id = str(raw_id).strip()
+    cancel_id = str(
+        first_present(item, ("orderId", "consignOrderId", "consignmentOrderId", "consignmentOrderNo"))
+        or ""
+    ).strip()
+    display_id = numeric_market_id or order_uuid or cancel_id
+    purchase_id = numeric_market_id or order_uuid or cancel_id
+    return {
+        "digital_collection_id": digital_collection_id,
+        "order_uuid": order_uuid,
+        "market_listing_id": numeric_market_id,
+        "cancel_id": cancel_id,
+        "consign_order_id": cancel_id or order_uuid or numeric_market_id,
+        "display_id": display_id,
+        "purchase_id": purchase_id,
+    }
+
+
+def warm_market_group_context(
+    client,
+    group_id: str,
+    *,
+    headers: dict | None = None,
+) -> dict | None:
+    path = (
+        f"/public-market-service/digital-collection-groups/{group_id}"
+        "/purchase-consignment-info?configType=0"
+    )
+    result = client.get(path, headers=headers)
+    if not is_success(result):
+        code = result.get("code") if isinstance(result, dict) else result
+        message = result.get("message") if isinstance(result, dict) else ""
+        print(
+            f"[market-list] warmup failed group_id={group_id} code={code} message={message}",
+            flush=True,
+        )
+        return result if isinstance(result, dict) else {"code": code, "message": message}
+    return None
+
+
+def resolve_seller_consign_entry_after_create(
+    client,
+    group_id: str,
+    digital_collection_id: str,
+    price_yuan: float,
+    create_order_id: str = "",
+) -> dict | None:
+    listed = list_consigned_orders_for_cancel(
+        client,
+        group_id,
+        price_yuan=price_yuan,
+        limit=30,
+    )
+    if not listed:
+        return None
+    orders, _ = listed
+    needle = str(create_order_id or "").strip()
+    for order in orders:
+        if str(order.get("digital_collection_id") or "") == str(digital_collection_id):
+            return order
+        if needle and needle in {
+            str(order.get("order_uuid") or ""),
+            str(order.get("consign_order_id") or ""),
+            str(order.get("market_listing_id") or ""),
+            str(order.get("display_id") or ""),
+            str(order.get("purchase_id") or ""),
+        }:
+            return order
+    return None
+
+
+def resolve_consign_order_id_after_create(
+    client,
+    group_id: str,
+    digital_collection_id: str,
+    price_yuan: float,
+) -> str | None:
+    entry = resolve_seller_consign_entry_after_create(
+        client,
+        group_id,
+        digital_collection_id,
+        price_yuan,
+    )
+    if not entry:
+        return None
+    return str(entry.get("display_id") or entry.get("consign_order_id") or "") or None
+
+
+def market_listing_identifiers(item: dict) -> set[str]:
+    ids: set[str] = set()
+    for key in (
+        "id",
+        "orderId",
+        "orderUuid",
+        "consignOrderId",
+        "consignmentOrderId",
+        "consignmentOrderNo",
+    ):
+        value = item.get(key)
+        if value not in (None, ""):
+            ids.add(str(value).strip())
+    return ids
+
+
+def listing_matches_consign_order_id(item: dict, consign_order_id: str) -> bool:
+    needle = str(consign_order_id or "").strip()
+    if not needle:
+        return True
+    return needle in market_listing_identifiers(item)
+
+
+def market_listing_purchase_id(item: dict) -> str:
+    numeric_id = item.get("id")
+    if numeric_id not in (None, "") and str(numeric_id).lstrip("-").isdigit():
+        return str(numeric_id).strip()
+    return str(
+        first_present(
+            item,
+            ("orderUuid", "orderId", "consignOrderId", "consignmentOrderId", "consignmentOrderNo", "id"),
+        )
+        or ""
+    ).strip()
+
+
+def resolve_market_listing_id_after_create(
+    client,
+    config: dict,
+    group_id: str,
+    list_uid: str,
+    *,
+    create_order_id: str = "",
+    digital_collection_id: str = "",
+    price_yuan: float | None = None,
+    retries: int = 8,
+    delay_sec: float = 2.0,
+) -> str | None:
+    target_fen = to_price_fen(price_yuan) if price_yuan is not None else None
+    for attempt in range(max(1, retries)):
+        if attempt > 0 and delay_sec > 0:
+            time.sleep(delay_sec)
+        listings, _ = fetch_group_market_listings(
+            client,
+            config,
+            group_id,
+            list_uid,
+            max_pages=5,
+        )
+        scanned = len(listings or [])
+        for item in listings or []:
+            if create_order_id and listing_matches_consign_order_id(item, create_order_id):
+                purchase_id = market_listing_purchase_id(item)
+                if purchase_id:
+                    print(
+                        f"[consign-create] resolved market listing id={purchase_id} "
+                        f"via createOrderId={create_order_id} (attempt {attempt + 1}, scanned={scanned})",
+                        flush=True,
+                    )
+                    return purchase_id
+            item_dc = market_listing_digital_collection_id(item)
+            if digital_collection_id and item_dc == str(digital_collection_id):
+                if target_fen is not None:
+                    item_fen = market_listing_price_fen(item)
+                    if item_fen != target_fen:
+                        continue
+                purchase_id = market_listing_purchase_id(item)
+                if purchase_id:
+                    print(
+                        f"[consign-create] resolved market listing id={purchase_id} "
+                        f"via digitalCollectionId={digital_collection_id} (attempt {attempt + 1}, scanned={scanned})",
+                        flush=True,
+                    )
+                    return purchase_id
+        print(
+            f"[consign-create] market listing not visible yet "
+            f"(attempt {attempt + 1}/{retries}, scanned={scanned}, createOrderId={create_order_id or '-'})",
+            flush=True,
+        )
+    return None
+
+
+def market_listing_order_id(item: dict) -> str:
+    return market_listing_purchase_id(item)
+
+
+def market_listing_digital_collection_id(item: dict) -> str:
+    value = first_present(
+        item,
+        ("digitalCollectionId", "collectionId", "digitalCollectionID", "collectionID"),
+    )
+    if value not in (None, ""):
+        return str(value).strip()
+    digital_collection = item.get("digitalCollection")
+    if isinstance(digital_collection, dict):
+        nested = digital_collection.get("id")
+        if nested not in (None, ""):
+            return str(nested).strip()
+    return ""
+
+
+def fetch_group_market_listings(
+    client,
+    config: dict,
+    group_id: str,
+    buyer_uid: str,
+    *,
+    page_size: int = 50,
+    max_pages: int = 10,
+    use_webview_headers: bool = True,
+    app_version: str = "2.3.2",
+) -> tuple[list[dict], dict | None]:
+    listings: list[dict] = []
+    headers = None
+    if use_webview_headers:
+        headers = build_webview_api_headers(
+            getattr(client, "token", None),
+            app_version=app_version,
+        )
+        warm_err = warm_market_group_context(client, group_id, headers=headers)
+        if warm_err and is_auth_failure(warm_err):
+            return None, warm_err
+    for page_no in range(1, max(1, int(max_pages)) + 1):
+        path = render_command_path(
+            config,
+            "market-list",
+            (
+                "/public-market-service/digital-collection-groups/{group_id}"
+                "/consignment-orders?pageNo={page_no}&pageSize={page_size}"
+                "&sortType={sort_type}&sortField={sort_field}&uid={uid}"
+            ),
+            group_id=group_id,
+            page_no=str(page_no),
+            page_size=str(page_size),
+            sort_type=get_command_default(config, "market-list", "sort_type", "1"),
+            sort_field=get_command_default(config, "market-list", "sort_field", "1"),
+            uid=buyer_uid,
+        )
+        result, api_error = client_get_with_rate_limit_retry(
+            client,
+            path,
+            label=f"market-list group_id={group_id} page={page_no}",
+            headers=headers,
+        )
+        if result is None:
+            if api_error and is_auth_failure(api_error):
+                return None, api_error
+            return listings if listings else None, api_error
+        if page_no == 1 and isinstance(result, dict) and is_auth_failure(result):
+            return None, result
+        items = extract_list_payload(result)
+        if isinstance(items, list):
+            listings.extend(item for item in items if isinstance(item, dict))
+        elif isinstance(result, dict) and page_no == 1:
+            print(
+                f"[market-list] empty/unparsed list group_id={group_id} "
+                f"code={result.get('code')} message={result.get('message')}",
+                flush=True,
+            )
+        if not isinstance(items, list) or not _list_page_has_more(
+            result,
+            page_no=page_no,
+            page_size=page_size,
+            items_count=len(items),
+        ):
+            break
+        if page_no < max_pages and LIST_OWNED_PAGE_INTERVAL_SEC > 0:
+            time.sleep(LIST_OWNED_PAGE_INTERVAL_SEC)
+    if not listings:
+        print(
+            f"[market-list] no listings returned group_id={group_id} uid={buyer_uid}",
+            flush=True,
+        )
+    return listings, None
+
+
+def market_listing_within_price_limit(item: dict, max_price_fen: int) -> tuple[bool, int | None]:
+    """Return (ok, price_fen) when listing unit price is at or below the instruction limit."""
+    item_fen = market_listing_price_fen(item)
+    if item_fen is None:
+        return False, None
+    return item_fen <= max_price_fen, item_fen
+
+
+def select_market_listings(
+    listings: list[dict],
+    *,
+    price_fen: int,
+    quantity: int,
+    seller_uid: str = "",
+    consign_order_id: str = "",
+    exact_price: bool = True,
+    exclude_ids: set[str] | frozenset[str] | None = None,
+    sort_cheapest: bool = False,
+) -> list[dict]:
+    selected: list[dict] = []
+    want = max(1, int(quantity))
+    seller_uid = str(seller_uid or "").strip()
+    consign_order_id = str(consign_order_id or "").strip()
+    skip_ids = exclude_ids or set()
+    for item in listings:
+        purchase_id = market_listing_purchase_id(item)
+        if not purchase_id or purchase_id in skip_ids:
+            continue
+        if consign_order_id and not listing_matches_consign_order_id(item, consign_order_id):
+            continue
+        ok_price, item_fen = market_listing_within_price_limit(item, price_fen)
+        if item_fen is None:
+            continue
+        if exact_price and item_fen != price_fen:
+            continue
+        if not exact_price and not ok_price:
+            continue
+        if seller_uid and market_listing_seller_uid(item) != seller_uid:
+            continue
+        selected.append(
+            {
+                "consign_order_id": purchase_id,
+                "digital_collection_id": market_listing_digital_collection_id(item),
+                "seller_uid": market_listing_seller_uid(item),
+                "price_fen": item_fen,
+                "raw": item,
+            }
+        )
+        if len(selected) >= want:
+            break
+    if sort_cheapest:
+        selected.sort(key=lambda entry: entry["price_fen"])
+    return selected
+
+
+def split_consign_purchase_ref(consign_order_id: str, digital_collection_id: str = "") -> tuple[str, str]:
+    order_id = str(consign_order_id or "").strip()
+    dc_id = str(digital_collection_id or "").strip()
+    if "|" in order_id:
+        left, right = order_id.split("|", 1)
+        order_id = left.strip()
+        if not dc_id:
+            dc_id = right.strip()
+    return order_id, dc_id
+
+
+def parse_consign_purchase_ref_list(
+    consign_order_id: str,
+    digital_collection_id: str = "",
+) -> list[tuple[str, str]]:
+    """Parse one or more orderId|digitalCollectionId pairs (、, ; or newline separated)."""
+    raw = str(consign_order_id or "").strip()
+    shared_dc = str(digital_collection_id or "").strip()
+    if not raw and not shared_dc:
+        return []
+    chunks = [part.strip() for part in re.split(r"[、,;\n]+", raw) if part.strip()] if raw else []
+    refs: list[tuple[str, str]] = []
+    for index, chunk in enumerate(chunks):
+        dc_hint = shared_dc if len(chunks) == 1 else ""
+        order_id, dc_id = split_consign_purchase_ref(chunk, dc_hint)
+        if order_id:
+            refs.append((order_id, dc_id))
+    if not refs and raw:
+        order_id, dc_id = split_consign_purchase_ref(raw, shared_dc)
+        if order_id:
+            refs.append((order_id, dc_id or shared_dc))
+    return refs
+
+
+def build_market_purchase_payload(
+    consign_order_id: str,
+    payment_platform: int,
+    consignment_password: str,
+    *,
+    digital_collection_id: str = "",
+    extra: dict | None = None,
+) -> dict:
+    payload: dict = {
+        "consignmentOrderId": str(consign_order_id),
+        "orderId": str(consign_order_id),
+        "paymentPlatformCode": int(payment_platform),
+        **build_consign_password_fields(consignment_password),
+    }
+    if digital_collection_id:
+        payload["digitalCollectionId"] = int(digital_collection_id)
+    if extra:
+        payload.update(extra)
+    return payload
+
+
+def extract_purchase_order_id(create_result: dict | None) -> str:
+    if not isinstance(create_result, dict):
+        return ""
+    data = create_result.get("data")
+    if isinstance(data, dict):
+        order_id = first_present(data, ("orderId", "orderUUId", "orderUuid", "id"))
+        if order_id not in (None, ""):
+            return str(order_id)
+    nested = first_present(create_result, ("orderId", "orderUUId", "orderUuid", "id"))
+    return "" if nested in (None, "") else str(nested)
+
+
+def fetch_purchase_cashier(
+    client,
+    purchase_order_id: str,
+    *,
+    payment_initiator_type: int = 0,
+) -> dict:
+    path = (
+        f"/payment-service/cashiers/gain"
+        f"?orderUUId={purchase_order_id}&paymentInitiatorType={int(payment_initiator_type)}"
+    )
+    return client.get(path)
+
+
+def complete_purchase_payment(
+    client,
+    *,
+    create_result: dict,
+    consignment_password: str,
+    ibox_token: str,
+    app_version: str,
+    max_price_yuan: float | None = None,
+    config: dict | None = None,
+    payment_initiator_type: int = 0,
+    label: str = "market-purchase",
+) -> dict:
+    from src.hfpay_wallet import (
+        parse_wallet_uuid,
+        pay_via_wallet_cashier,
+        resolve_encrypted_wallet_password,
+    )
+
+    purchase_order_id = extract_purchase_order_id(create_result)
+    if not purchase_order_id:
+        return {
+            "paid": False,
+            "error": "create succeeded but response missing purchase orderId",
+            "create": create_result,
+        }
+
+    print(
+        f"[{label}] order locked (unpaid) purchaseOrderId={purchase_order_id}",
+        flush=True,
+    )
+    out: dict = {
+        "purchase_order_id": purchase_order_id,
+        "paid": False,
+        "create": create_result,
+    }
+
+    cashier = fetch_purchase_cashier(
+        client,
+        purchase_order_id,
+        payment_initiator_type=payment_initiator_type,
+    )
+    out["cashier"] = cashier
+    if not is_success(cashier):
+        out["error"] = (
+            f"cashier/gain failed: code={cashier.get('code')} message={cashier.get('message')}"
+        )
+        print(f"[{label}] {out['error']}", flush=True)
+        return out
+
+    link = first_present(cashier.get("data") or {}, ("link", "cashierLink", "url"))
+    if not link:
+        out["error"] = "cashier/gain succeeded but link missing"
+        print(f"[{label}] {out['error']}", flush=True)
+        return out
+
+    out["cashierLink"] = link
+    print(
+        f"[{label}] paying via Huifu wallet (same as App cashier)…",
+        flush=True,
+    )
+
+    wallet_uuid = parse_wallet_uuid(link)
+    enc_pwd, pwd_hint = resolve_encrypted_wallet_password(
+        config,
+        plain_password=consignment_password,
+        wallet_uuid=wallet_uuid,
+    )
+    print(f"[{label}] wallet-pay: {pwd_hint}", flush=True)
+    if not enc_pwd:
+        out["error"] = pwd_hint
+        return out
+    if not ibox_token:
+        out["error"] = "missing ibox token for wallet session"
+        return out
+
+    wallet_result = pay_via_wallet_cashier(
+        cashier_link=link,
+        ibox_token=str(ibox_token),
+        encrypted_password=enc_pwd,
+        app_version=app_version,
+        max_trans_amt_yuan=max_price_yuan,
+    )
+    out["wallet_pay"] = wallet_result
+    trans_amt = wallet_result.get("trans_amt")
+    if trans_amt not in (None, ""):
+        print(f"[{label}] cashier trans_amt={trans_amt} yuan", flush=True)
+
+    if wallet_result.get("ok"):
+        out["paid"] = True
+        print(f"[{label}] wallet payment success", flush=True)
+        return out
+
+    out["error"] = wallet_result.get("error") or "wallet payment failed"
+    print(f"[{label}] wallet payment failed: {out['error']}", flush=True)
+    out["hint"] = (
+        "Order is locked but unpaid. Open iBox → 订单中心 → 待支付, "
+        f"or pay manually: {link}"
+    )
+    return out
+
+
+CONSIGN_POST_INTERVAL_SEC = 0.5
+LIST_OWNED_PAGE_INTERVAL_SEC = 0.35
+MARKET_BUY_DEFAULT_POLL_INTERVAL_SEC = 2.0
+
+
+def run_market_buy_sweep(
+    *,
+    client,
+    config: dict,
+    uid: str,
+    group_id: str,
+    collection_name: str,
+    target_price_yuan: float,
+    target_qty: int,
+    consignment_password: str,
+    payment_platform: int,
+    purchase_path: str,
+    extra_payload: dict,
+    ibox_token: str,
+    app_version: str = "2.3.2",
+    list_pages: int = 10,
+    poll_interval: float = MARKET_BUY_DEFAULT_POLL_INTERVAL_SEC,
+) -> dict:
+    """
+    Scan public market listings and buy one-by-one until target_qty is reached.
+    Only locks and pays when listing unit price <= target_price_yuan (instruction limit).
+    Keeps polling when no eligible listings are available.
+    """
+    target_price_fen = int(round(float(target_price_yuan) * 100))
+    remaining = max(1, int(target_qty))
+    success_count = 0
+    fail_count = 0
+    results: list[dict] = []
+    tried_ids: set[str] = set()
+    poll_interval = max(0.5, float(poll_interval))
+    round_no = 0
+
+    print(
+        f"[market-buy] sweep group_id={group_id} max_price={target_price_yuan}yuan "
+        f"target_qty={target_qty} list_pages={list_pages} poll_interval={poll_interval:g}s",
+        flush=True,
+    )
+    report_task_progress(0, target_qty)
+
+    while remaining > 0:
+        round_no += 1
+        listings, list_error = fetch_group_market_listings(
+            client,
+            config,
+            group_id,
+            uid,
+            max_pages=max(1, int(list_pages)),
+            app_version=app_version,
+        )
+        if listings is None:
+            listings = []
+        if list_error and is_auth_failure(list_error):
+            message = str(list_error.get("message") or list_error.get("error") or "登录已失效")
+            return {
+                "code": 1,
+                "error": (
+                    f"market-list auth failed: {message}. "
+                    "Saved session may have expired — pass SMS code to log in again."
+                ),
+                "auth_failure": True,
+                "group_id": group_id,
+            }
+        if not listings and list_error:
+            detail = ""
+            if isinstance(list_error, dict):
+                detail = f" code={list_error.get('code')} message={list_error.get('message')}"
+            print(
+                f"[market-buy] round {round_no}: market list failed{detail}; "
+                f"retry in {poll_interval:g}s (remaining={remaining})",
+                flush=True,
+            )
+            time.sleep(poll_interval)
+            continue
+
+        candidates = select_market_listings(
+            listings,
+            price_fen=target_price_fen,
+            quantity=remaining,
+            exact_price=False,
+            exclude_ids=tried_ids,
+            sort_cheapest=True,
+        )
+        if not candidates:
+            print(
+                f"[market-buy] round {round_no}: no listing <= {target_price_yuan}yuan "
+                f"(scanned={len(listings)}, remaining={remaining}); retry in {poll_interval:g}s",
+                flush=True,
+            )
+            time.sleep(poll_interval)
+            continue
+
+        entry = candidates[0]
+        order_id = entry["consign_order_id"]
+        item_fen = int(entry["price_fen"])
+        item_yuan = item_fen / 100.0
+        tried_ids.add(order_id)
+
+        if item_fen > target_price_fen:
+            print(
+                f"[market-buy] skip consignOrderId={order_id}: "
+                f"price {item_yuan:g}yuan > limit {target_price_yuan:g}yuan",
+                flush=True,
+            )
+            fail_count += 1
+            continue
+
+        index = success_count + fail_count + 1
+        payload = build_market_purchase_payload(
+            order_id,
+            payment_platform,
+            consignment_password,
+            digital_collection_id=entry.get("digital_collection_id") or "",
+            extra=extra_payload,
+        )
+        print(
+            f"[market-buy] locking {index} consignOrderId={order_id} "
+            f"price={item_yuan:g}yuan (limit {target_price_yuan:g}yuan, remaining={remaining})",
+            flush=True,
+        )
+        create_result = client_post_with_rate_limit_retry(
+            client,
+            purchase_path,
+            payload,
+            label=f"market-buy {success_count + 1}/{target_qty}",
+        )
+        if not is_success(create_result):
+            fail_count += 1
+            print(
+                f"[market-buy] lock failed consignOrderId={order_id}: "
+                f"code={create_result.get('code')} message={create_result.get('message')}",
+                flush=True,
+            )
+            results.append(
+                {
+                    "consign_order_id": order_id,
+                    "price_yuan": item_yuan,
+                    "ok": False,
+                    "paid": False,
+                    "result": create_result,
+                }
+            )
+            if CONSIGN_POST_INTERVAL_SEC > 0:
+                time.sleep(CONSIGN_POST_INTERVAL_SEC)
+            continue
+
+        payment = complete_purchase_payment(
+            client,
+            create_result=create_result,
+            consignment_password=consignment_password,
+            ibox_token=ibox_token,
+            app_version=app_version,
+            max_price_yuan=target_price_yuan,
+            config=config,
+            label=f"market-buy {success_count + 1}/{target_qty}",
+        )
+        paid = bool(payment.get("paid"))
+        wallet_pay = payment.get("wallet_pay") or {}
+        if wallet_pay.get("aborted_before_pay"):
+            paid = False
+            print(
+                f"[market-buy] payment aborted: {wallet_pay.get('error') or payment.get('error')}",
+                flush=True,
+            )
+
+        purchase_entry = {
+            "consign_order_id": order_id,
+            "seller_uid": entry.get("seller_uid"),
+            "digital_collection_id": entry.get("digital_collection_id"),
+            "price_yuan": item_yuan,
+            "ok": paid,
+            "paid": paid,
+            "purchase_order_id": payment.get("purchase_order_id"),
+            "cashierLink": payment.get("cashierLink"),
+            "create": create_result,
+            "payment": payment,
+            "result": create_result if paid else payment,
+        }
+        results.append(purchase_entry)
+        if paid:
+            success_count += 1
+            remaining -= 1
+            report_task_progress(success_count, target_qty)
+            print(
+                f"[market-buy] paid ok; progress {success_count}/{target_qty}",
+                flush=True,
+            )
+        else:
+            fail_count += 1
+            print(
+                f"[market-buy] lock ok but pay failed consignOrderId={order_id}: "
+                f"{payment.get('error') or 'wallet payment failed'}",
+                flush=True,
+            )
+
+        if remaining > 0 and CONSIGN_POST_INTERVAL_SEC > 0:
+            time.sleep(CONSIGN_POST_INTERVAL_SEC)
+
+    summary = (
+        f"{collection_name}捡漏已完成，购买个数：{success_count}，失败个数：{fail_count}"
+    )
+    print(summary, flush=True)
+    return {
+        "code": 0 if success_count >= target_qty else 1,
+        "message": summary,
+        "summary": summary,
+        "collectionName": collection_name,
+        "successCount": success_count,
+        "failCount": fail_count,
+        "targetQty": target_qty,
+        "maxPriceYuan": target_price_yuan,
+        "group_id": group_id,
+        "rounds": round_no,
+        "results": results,
+    }
+
+
+def _list_page_has_more(result: dict, *, page_no: int, page_size: int, items_count: int) -> bool:
+    if items_count < page_size:
+        return False
+    data = result.get("data")
+    if not isinstance(data, dict):
+        return items_count >= page_size
+    if data.get("hasMore") is False:
+        return False
+    total = to_int(
+        first_present(data, ("total", "totalCount", "totalNum", "count", "recordCount"))
+    )
+    if total is not None and page_no * page_size >= total:
+        return False
+    page_count = to_int(first_present(data, ("totalPages", "pageCount", "pages")))
+    if page_count is not None and page_no >= page_count:
+        return False
+    return True
+
+
 def list_owned_collection_items(
     client,
     group_id: str,
     *,
     lock_status: int | None = None,
     consigned_only: bool = False,
-) -> list[dict] | None:
+    item_limit: int | None = None,
+) -> tuple[list[dict] | None, dict | None]:
     items_out: list[dict] = []
     page_no = 1
     page_size = 50
+    max_pages = 100
+    if item_limit is not None:
+        max_pages = min(max_pages, max(1, (int(item_limit) + page_size - 1) // page_size))
     while True:
         path = (
             f"/personal-center-service/users/digital-collection-groups/{group_id}"
@@ -905,9 +1998,19 @@ def list_owned_collection_items(
         )
         if lock_status is not None:
             path += f"&lockStatus={int(lock_status)}"
-        result = client.get(path)
-        if not is_success(result):
-            return None
+        result, api_error = client_get_with_rate_limit_retry(
+            client,
+            path,
+            label=f"list-owned-items group_id={group_id} page={page_no}",
+        )
+        if result is None:
+            if isinstance(api_error, dict):
+                print(
+                    f"[list-owned-items] API failed group_id={group_id} lockStatus={lock_status} "
+                    f"code={api_error.get('code')} message={api_error.get('message')}",
+                    flush=True,
+                )
+            return None, api_error if isinstance(api_error, dict) else {"error": str(api_error)}
         items = extract_list_payload(result)
         if not isinstance(items, list):
             break
@@ -917,15 +2020,16 @@ def list_owned_collection_items(
             if consigned_only and int(item.get("consignmentStatus") or 0) != 1:
                 continue
             items_out.append(item)
-        if len(items) < page_size:
-            break
-        data = result.get("data")
-        if isinstance(data, dict) and data.get("hasMore") is False:
+            if item_limit is not None and len(items_out) >= item_limit:
+                return items_out[:item_limit], None
+        if not _list_page_has_more(result, page_no=page_no, page_size=page_size, items_count=len(items)):
             break
         page_no += 1
-        if page_no > 100:
+        if page_no > max_pages:
             break
-    return items_out
+        if LIST_OWNED_PAGE_INTERVAL_SEC > 0:
+            time.sleep(LIST_OWNED_PAGE_INTERVAL_SEC)
+    return items_out, None
 
 
 def list_unlocked_digital_collection_ids(
@@ -933,21 +2037,591 @@ def list_unlocked_digital_collection_ids(
     group_id: str,
     *,
     limit: int | None = None,
-) -> list[str] | None:
-    items = list_owned_collection_items(client, group_id, lock_status=0)
-    if items is None:
-        return None
-    collection_ids: list[str] = []
+) -> tuple[list[str] | None, dict | None]:
     want = max(1, int(limit)) if limit is not None else None
+    items, api_error = list_owned_collection_items(
+        client,
+        group_id,
+        lock_status=0,
+        item_limit=want,
+    )
+    if items is None:
+        return None, api_error
+    collection_ids: list[str] = []
     for item in items:
         cid = first_present(item, _OWNED_COLLECTION_ID_KEYS)
         if cid not in (None, ""):
             collection_ids.append(str(cid))
             if want is not None and len(collection_ids) >= want:
-                return collection_ids[:want]
+                return collection_ids[:want], None
     if want is not None:
-        return collection_ids[:want]
-    return collection_ids
+        return collection_ids[:want], None
+    return collection_ids, None
+
+
+WANTED_DEAL_POST_INTERVAL_SEC = 1.0
+WANTED_DEAL_DEFAULT_POLL_INTERVAL_SEC = 10.0
+WANTED_DEAL_MAX_CANDIDATES_PER_ROUND = 25
+WANTED_DEAL_STALE_ORDER_CODES = frozenset({"3600000", "3600002"})
+
+
+def wanted_deal_relation_key(purchase_order_id: str, relation_id: str) -> str:
+    return f"{purchase_order_id}:{relation_id}"
+
+
+def is_wanted_deal_stale_order(result: dict | None) -> bool:
+    if not isinstance(result, dict):
+        return False
+    return str(result.get("code")) in WANTED_DEAL_STALE_ORDER_CODES
+
+
+def dedupe_wanted_deal_candidates(candidates: list[dict]) -> list[dict]:
+    """One attempt per purchase order per round — avoids stale relation spam."""
+    best_by_po: dict[str, dict] = {}
+    for candidate in candidates:
+        po_id = str(candidate["purchase_order_id"])
+        prev = best_by_po.get(po_id)
+        if prev is None or (candidate.get("price_fen") or 0) > (prev.get("price_fen") or 0):
+            best_by_po[po_id] = candidate
+    out = list(best_by_po.values())
+    out.sort(key=lambda c: (c["price_fen"] or 0), reverse=True)
+    return out
+
+
+def ensure_wanted_deal_collection_pool(
+    client,
+    group_id: str,
+    *,
+    used_ids: set[str],
+    min_available: int,
+    pools: dict[str, list[str]],
+    force_refresh: bool = False,
+) -> tuple[bool, dict | None]:
+    """Return (pool_ready, error). error is set on auth failure or list API failure."""
+    if not force_refresh:
+        available = [cid for cid in pools.get(group_id, []) if cid not in used_ids]
+        pools[group_id] = available
+        if available:
+            return True, None
+    fetch_limit = max(min_available, 20) + len(used_ids) + 5
+    item_ids, list_error = list_unlocked_digital_collection_ids(
+        client,
+        group_id,
+        limit=fetch_limit,
+    )
+    if item_ids is None:
+        detail = ""
+        if isinstance(list_error, dict):
+            detail = f" (API code={list_error.get('code')} message={list_error.get('message')})"
+        print(
+            f"[wanted-deal] failed to list unlocked collections for group {group_id}{detail}",
+            flush=True,
+        )
+        if isinstance(list_error, dict) and is_auth_failure(list_error):
+            return False, list_error
+        return False, None
+    pools[group_id] = [cid for cid in item_ids if cid not in used_ids]
+    if pools[group_id]:
+        print(
+            f"[wanted-deal] loaded {len(pools[group_id])} unlocked collection(s) "
+            f"for group {group_id}",
+            flush=True,
+        )
+    return bool(pools[group_id]), None
+
+
+def peek_wanted_deal_collection_id(
+    group_id: str,
+    *,
+    override: str,
+    used_ids: set[str],
+    pools: dict[str, list[str]],
+) -> str | None:
+    override = str(override or "").strip()
+    if override and override not in used_ids:
+        return override
+    for cid in pools.get(group_id, []):
+        if cid not in used_ids:
+            return cid
+    return None
+
+
+def mark_wanted_deal_collection_consumed(
+    group_id: str,
+    collection_id: str,
+    *,
+    used_ids: set[str],
+    pools: dict[str, list[str]],
+) -> None:
+    used_ids.add(str(collection_id))
+    pools[group_id] = [cid for cid in pools.get(group_id, []) if cid != str(collection_id)]
+
+
+def resolve_wanted_deal_collection_id(
+    client,
+    group_id: str,
+    *,
+    override: str,
+    used_ids: set[str],
+    pools: dict[str, list[str]],
+    min_available: int,
+) -> tuple[str | None, dict | None]:
+    """Pick an unlocked collection id, refreshing the pool from API when needed."""
+    collection_id = peek_wanted_deal_collection_id(
+        group_id,
+        override=override,
+        used_ids=used_ids,
+        pools=pools,
+    )
+    if collection_id:
+        return collection_id, None
+    pool_ready, pool_error = ensure_wanted_deal_collection_pool(
+        client,
+        group_id,
+        used_ids=used_ids,
+        min_available=min_available,
+        pools=pools,
+        force_refresh=True,
+    )
+    if pool_error and is_auth_failure(pool_error):
+        return None, pool_error
+    if pool_ready:
+        collection_id = peek_wanted_deal_collection_id(
+            group_id,
+            override=override,
+            used_ids=used_ids,
+            pools=pools,
+        )
+        if collection_id:
+            return collection_id, None
+    return None, None
+
+
+def wanted_deal_candidate_from_order(
+    group: dict,
+    order: dict,
+    *,
+    min_price_fen: int,
+    payment_platform: int,
+) -> dict | None:
+    po_id = first_present(
+        order,
+        ("id", "purchaseOrderId", "purchaseConsignmentOrderId", "purchaseOrderNo", "advanceOrderId"),
+    )
+    relation_id = first_present(order, ("orderRelationId", "relationId", "relation_id"))
+    if po_id in (None, "") or relation_id in (None, ""):
+        return None
+    price_fen = to_price_fen(first_present(order, ("price", "unitPrice", "salePrice")))
+    if min_price_fen > 0 and price_fen is not None and price_fen < min_price_fen:
+        return None
+    return {
+        "group_id": group["group_id"],
+        "group_name": group["name"],
+        "purchase_order_id": str(po_id),
+        "relation_id": str(relation_id),
+        "price_fen": price_fen,
+        "price_yuan": None if price_fen is None else price_fen / 100,
+        "payment_platform": first_present(order, ("paymentPlatformCode", "paymentPlatform")) or payment_platform,
+    }
+
+
+def list_group_wanted_purchase_orders(
+    client,
+    group_id: str,
+    uid: str,
+    *,
+    page_size: int,
+    max_pages: int,
+    webview_headers: dict | None = None,
+    warmup_path: str | None = None,
+) -> tuple[list[dict], dict | None]:
+    if warmup_path:
+        warm_result, warm_err = client_get_with_rate_limit_retry(
+            client,
+            warmup_path,
+            label=f"wanted-deal warmup group={group_id}",
+        )
+        if warm_result is None and warm_err and is_auth_failure(warm_err):
+            return [], warm_err
+    orders: list[dict] = []
+    page_size = max(1, int(page_size))
+    for page_no in range(1, max(1, int(max_pages)) + 1):
+        path = (
+            f"/public-market-service/digital-collection-groups/{group_id}"
+            f"/purchase-orders?pageNo={page_no}&pageSize={page_size}&uid={uid}"
+        )
+        result, api_error = client_get_with_rate_limit_retry(
+            client,
+            path,
+            headers=webview_headers,
+            label=f"wanted-deal purchase-orders group={group_id} page={page_no}",
+        )
+        if result is None:
+            if api_error and is_auth_failure(api_error):
+                return orders, api_error
+            print(
+                f"[wanted-deal] purchase-orders failed for group {group_id} page={page_no}: "
+                f"code={(api_error or {}).get('code')} message={(api_error or {}).get('message')}",
+                flush=True,
+            )
+            break
+        if is_auth_failure(result):
+            return orders, result
+        page_items = extract_list_payload(result)
+        if not isinstance(page_items, list):
+            break
+        orders.extend(item for item in page_items if isinstance(item, dict))
+        data = result.get("data")
+        if isinstance(data, dict) and data.get("hasMore") is False:
+            break
+        if len(page_items) < page_size:
+            break
+    return orders, None
+
+
+def pick_next_wanted_deal_collection_id(
+    client,
+    group_id: str,
+    *,
+    override: str = "",
+    used_ids: set[str] | None = None,
+) -> str | None:
+    used = used_ids or set()
+    override = str(override or "").strip()
+    if override and override not in used:
+        return override
+    item_ids, list_error = list_unlocked_digital_collection_ids(client, group_id, limit=100)
+    if item_ids is None:
+        detail = ""
+        if isinstance(list_error, dict):
+            detail = f" (API code={list_error.get('code')} message={list_error.get('message')})"
+        print(
+            f"[wanted-deal] failed to list unlocked collections for group {group_id}{detail}",
+            flush=True,
+        )
+        return None
+    for cid in item_ids:
+        if cid not in used:
+            return cid
+    return None
+
+
+def build_wanted_deal_payload(
+    *,
+    payment_platform: int,
+    collection_id: str,
+    consignment_password: str,
+    extra: dict | None = None,
+) -> dict:
+    pwd = str(consignment_password)
+    payload = {
+        "paymentPlatformCode": int(payment_platform),
+        "digitalCollectionId": int(collection_id),
+        "consignmentPassword": pwd,
+        "password": pwd,
+        "consignPassword": pwd,
+        "consignmentPassWord": pwd,
+    }
+    if extra:
+        payload.update(extra)
+    return payload
+
+
+def build_wanted_buy_payload(
+    group_id: str,
+    price_yuan: float,
+    quantity: int,
+    payment_platform: int,
+    *,
+    extra: dict | None = None,
+) -> dict:
+    """Create wanted-buy order body (matches H5 wantToBuy page: buyCount, not quantity)."""
+    price_val: int | float = float(price_yuan)
+    if price_val == int(price_val):
+        price_val = int(price_val)
+    payload = {
+        "groupId": int(group_id),
+        "price": price_val,
+        "buyCount": max(1, int(quantity)),
+        "paymentPlatformCode": int(payment_platform),
+    }
+    if extra:
+        payload.update(extra)
+    return payload
+
+
+def warmup_wanted_buy(client, group_id: str) -> None:
+    """Mirror App pre-submit GETs on the wantToBuy page."""
+    client_get_with_rate_limit_retry(
+        client,
+        f"/public-service/platform-rate?groupId={group_id}",
+        label=f"wanted-buy warmup platform-rate group={group_id}",
+    )
+    client_get_with_rate_limit_retry(
+        client,
+        "/payment-service/payment-platforms?placeOrderMethod=2",
+        label="wanted-buy warmup payment-platforms",
+    )
+
+
+def warmup_sale_rush(client) -> None:
+    client_get_with_rate_limit_retry(
+        client,
+        "/payment-service/payment-platforms?placeOrderMethod=0",
+        label="sale-rush warmup payment-platforms",
+    )
+
+
+def _unwrap_get_result(result_pair: tuple[dict | None, dict | None]) -> dict | None:
+    result, api_error = result_pair
+    if result is not None:
+        return result
+    return api_error
+
+
+def fetch_group_sale_info(client, group_id: str) -> dict | None:
+    return _unwrap_get_result(
+        client_get_with_rate_limit_retry(
+            client,
+            f"/public-service/digital-collection-groups/{group_id}/sale-info",
+            label=f"sale-rush sale-info group={group_id}",
+        )
+    )
+
+
+def fetch_sale_info_by_id(client, sale_id: str) -> dict | None:
+    return _unwrap_get_result(
+        client_get_with_rate_limit_retry(
+            client,
+            f"/public-service/sale-infos/{sale_id}",
+            label=f"sale-rush sale-info id={sale_id}",
+        )
+    )
+
+
+def list_sale_infos_page(client, *, page_no: int = 1, page_size: int = 20) -> dict | None:
+    return _unwrap_get_result(
+        client_get_with_rate_limit_retry(
+            client,
+            f"/public-service/sale-infos?sortField=0&sortType=1&pageNo={page_no}&pageSize={page_size}",
+            label=f"sale-rush list sale-infos page={page_no}",
+        )
+    )
+
+
+def match_sale_infos_by_name(items: list, collection_name: str) -> list[dict]:
+    normalized_target = normalize_collection_name(collection_name)
+    matched: list[dict] = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        display = sale_display_name_from_info(item)
+        if display and collection_name_matches(collection_name, display):
+            matched.append(item)
+    if normalized_target:
+        exact = [
+            item
+            for item in matched
+            if normalize_collection_name(sale_display_name_from_info(item)) == normalized_target
+        ]
+        return exact or matched
+    return matched
+
+
+def resolve_sale_target_by_collection_name(
+    client,
+    collection_name: str,
+    *,
+    max_pages: int = 10,
+) -> dict:
+    """Match a first-sale activity by scanning /public-service/sale-infos pages."""
+    seen_names: list[str] = []
+    for page_no in range(1, max(1, int(max_pages)) + 1):
+        result = list_sale_infos_page(client, page_no=page_no)
+        if result is None:
+            return {"code": 1, "error": "failed to list sale-infos"}
+        if not is_success(result):
+            return result
+
+        data = (result or {}).get("data")
+        items: list = []
+        has_more = False
+        if isinstance(data, dict):
+            raw_list = data.get("list") or data.get("records") or []
+            items = raw_list if isinstance(raw_list, list) else []
+            has_more = bool(data.get("hasMore"))
+        else:
+            extracted = extract_list_payload(result)
+            items = extracted if isinstance(extracted, list) else []
+
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            name = sale_display_name_from_info(item)
+            if name and name not in seen_names:
+                seen_names.append(name)
+
+        matched = match_sale_infos_by_name(items, collection_name)
+        if matched:
+            if len(matched) > 1:
+                names = [sale_display_name_from_info(item) for item in matched[:8]]
+                return {
+                    "code": 1,
+                    "error": (
+                        f"multiple sale activities match {collection_name!r}: "
+                        + "、".join(names)
+                    ),
+                    "similar": names,
+                }
+            item = matched[0]
+            sale_id = str(first_present(item, ("id", "saleId", "saleInfoId")) or "")
+            group_id = str(first_present(item, ("groupId", "digitalCollectionGroupId")) or "")
+            display = sale_display_name_from_info(item, collection_name)
+            print(
+                f"[sale-rush] sale-infos: {collection_name!r} -> "
+                f"sale_id={sale_id} group_id={group_id} name={display!r}",
+                flush=True,
+            )
+            return {
+                "code": 0,
+                "sale_id": sale_id,
+                "group_id": group_id,
+                "collection_name": display,
+            }
+
+        if not has_more and len(items) < 20:
+            break
+
+    suggestions = suggest_owned_collection_names(
+        [{"name": name} for name in seen_names],
+        collection_name,
+        limit=8,
+    )
+    message = f"sale activity for '{collection_name}' not found in sale-infos list"
+    if suggestions:
+        message += "; similar sale names: " + "、".join(suggestions)
+    return {"code": 1, "error": message, "similar": suggestions}
+
+
+def extract_sale_info_record(result: dict | None) -> dict | None:
+    if not is_success(result):
+        return None
+    data = (result or {}).get("data")
+    return data if isinstance(data, dict) else None
+
+
+def sale_display_name_from_info(sale_data: dict, fallback: str = "") -> str:
+    group = sale_data.get("digitalCollectionGroup")
+    if isinstance(group, dict):
+        name = first_present(group, ("name", "groupName", "collectionName"))
+        if name:
+            return str(name)
+    return fallback
+
+
+def build_sale_order_payload(
+    num: int,
+    payment_platform: int,
+    *,
+    extra: dict | None = None,
+) -> dict:
+    payload = {
+        "num": max(1, int(num)),
+        "paymentPlatformCode": int(payment_platform),
+    }
+    if extra:
+        payload.update(extra)
+    return payload
+
+
+def build_sale_order_path(config: dict, sale_id: str, captcha_params: dict) -> str:
+    params = captcha_params or {}
+    return render_command_path(
+        config,
+        "sale-rush",
+        (
+            "/order-create-service/sales/{sale_id}/orders"
+            "?captcha_id={captcha_id}&lot_number={lot_number}"
+            "&pass_token={pass_token}&gen_time={gen_time}&captcha_output={captcha_output}"
+        ),
+        sale_id=str(sale_id),
+        captcha_id=params.get("captcha_id", ""),
+        lot_number=params.get("lot_number", ""),
+        pass_token=params.get("pass_token", ""),
+        gen_time=params.get("gen_time", ""),
+        captcha_output=params.get("captcha_output", ""),
+    )
+
+
+def resolve_sale_rush_target(
+    client,
+    *,
+    sale_id: str,
+    group_id: str,
+    collection_name: str,
+    config: dict,
+) -> dict:
+    info_result: dict | None = None
+    resolved_group_id = (group_id or "").strip()
+    resolved_sale_id = (sale_id or "").strip()
+
+    if resolved_sale_id:
+        info_result = fetch_sale_info_by_id(client, resolved_sale_id)
+    else:
+        if not resolved_group_id:
+            if not collection_name:
+                return {
+                    "code": 1,
+                    "error": "sale-rush requires --sale-id, --group-id, or --collection-name",
+                }
+            sale_lookup = resolve_sale_target_by_collection_name(client, collection_name)
+            if sale_lookup.get("code") not in (None, 0):
+                return sale_lookup
+            resolved_sale_id = str(sale_lookup.get("sale_id") or "")
+            resolved_group_id = str(sale_lookup.get("group_id") or "")
+            if not resolved_sale_id and not resolved_group_id:
+                return {
+                    "code": 1,
+                    "error": f"could not resolve sale activity for {collection_name!r}",
+                }
+        if resolved_sale_id:
+            info_result = fetch_sale_info_by_id(client, resolved_sale_id)
+        else:
+            info_result = fetch_group_sale_info(client, resolved_group_id)
+
+    if info_result is None:
+        return {"code": 1, "error": "failed to fetch sale-info"}
+    if not is_success(info_result):
+        return info_result
+
+    sale_data = extract_sale_info_record(info_result)
+    if not sale_data:
+        return {"code": 1, "error": "sale-info response missing data", "raw": info_result}
+
+    if not resolved_sale_id:
+        resolved_sale_id = str(first_present(sale_data, ("id", "saleId", "saleInfoId")) or "")
+    if not resolved_group_id:
+        resolved_group_id = str(
+            first_present(sale_data, ("groupId", "digitalCollectionGroupId")) or ""
+        )
+
+    on_sale_time = parse_datetime_value(first_present(sale_data, ("onSaleTime", "startTime")))
+    max_buy = to_int(first_present(sale_data, ("userOnceMaxBuyNum", "maxBuyNum", "maxNum")))
+    price = first_present(sale_data, ("price", "salePrice"))
+    price_yuan = float(price) if price is not None else None
+
+    return {
+        "code": 0,
+        "sale_id": resolved_sale_id,
+        "group_id": resolved_group_id,
+        "collection_name": sale_display_name_from_info(sale_data, collection_name),
+        "on_sale_time": on_sale_time,
+        "price_yuan": price_yuan,
+        "max_buy": max_buy,
+        "sale_status": to_int(first_present(sale_data, ("saleStatus", "status"))),
+        "priority_num": to_int(first_present(sale_data, ("priorityNum", "priority_num"))),
+        "sale_info": info_result,
+    }
 
 
 def list_consigned_orders_for_cancel(
@@ -958,30 +2632,67 @@ def list_consigned_orders_for_cancel(
     limit: int | None = None,
 ) -> tuple[list[dict], int] | None:
     """Owned items with consignmentStatus=1; orderId is the consign-orders/{id}/cancel id."""
-    items = list_owned_collection_items(client, group_id, consigned_only=True)
-    if items is None:
-        return None
     target_fen = int(round(float(price_yuan) * 100)) if price_yuan is not None else None
     orders: list[dict] = []
-    for item in items:
-        consign_id = first_present(
-            item,
-            ("orderId", "consignOrderId", "consignmentOrderId", "consignmentOrderNo"),
+    page_no = 1
+    page_size = 50
+    max_pages = 100
+    if limit is not None:
+        max_pages = min(max_pages, max(5, int(limit) * 3))
+    while True:
+        path = (
+            f"/personal-center-service/users/digital-collection-groups/{group_id}"
+            f"?pageSize={page_size}&pageNo={page_no}"
         )
-        if consign_id in (None, ""):
-            continue
-        if target_fen is not None:
-            item_fen = to_price_fen(item.get("price"))
-            if item_fen is None or item_fen != target_fen:
+        result, api_error = client_get_with_rate_limit_retry(
+            client,
+            path,
+            label=f"list-consigned-items group_id={group_id} page={page_no}",
+        )
+        if result is None:
+            if api_error:
+                print(
+                    f"[list-consigned-items] API failed group_id={group_id} "
+                    f"code={api_error.get('code')} message={api_error.get('message')}",
+                    flush=True,
+                )
+            return None
+        items = extract_list_payload(result)
+        if not isinstance(items, list):
+            break
+        for item in items:
+            if not isinstance(item, dict):
                 continue
-        orders.append(
-            {
-                "consign_order_id": str(consign_id),
-                "digital_collection_id": first_present(item, _OWNED_COLLECTION_ID_KEYS),
-                "name": item.get("name") or "",
-                "price": item.get("price"),
-            }
-        )
+            if int(item.get("consignmentStatus") or 0) != 1:
+                continue
+            consign_id = first_present(
+                item,
+                ("orderId", "consignOrderId", "consignmentOrderId", "consignmentOrderNo"),
+            )
+            if consign_id in (None, ""):
+                continue
+            if target_fen is not None:
+                item_fen = to_price_fen(item.get("price"))
+                if item_fen is None or item_fen != target_fen:
+                    continue
+            orders.append(
+                {
+                    **extract_consign_item_ids(item),
+                    "name": item.get("name") or "",
+                    "price": item.get("price"),
+                }
+            )
+        total_matched = len(orders)
+        if limit is not None and total_matched >= max(1, int(limit)):
+            orders = orders[: max(1, int(limit))]
+            return orders, total_matched
+        if not _list_page_has_more(result, page_no=page_no, page_size=page_size, items_count=len(items)):
+            break
+        page_no += 1
+        if page_no > max_pages:
+            break
+        if LIST_OWNED_PAGE_INTERVAL_SEC > 0:
+            time.sleep(LIST_OWNED_PAGE_INTERVAL_SEC)
     total_matched = len(orders)
     if limit is not None:
         orders = orders[: max(1, int(limit))]
@@ -1328,6 +3039,9 @@ def extract_activity_ids(activity_list_result: dict) -> list[str]:
         activity_id = first_present(node, ("activityId", "activityID", "id"))
         synthetic_count = first_present(node, ("syntheticNum", "syntheticCount", "syntheticsCount"))
         title = first_present(node, ("title", "name", "activityName"))
+        status = to_int(first_present(node, ("syntheticStatus", "status")))
+        if status == 2:
+            continue
         if activity_id in (None, ""):
             continue
         if synthetic_count is not None or title is not None:
@@ -1770,6 +3484,120 @@ def synthesis_needs_slider(center_result: dict) -> bool:
     return bool(need_slider)
 
 
+def resolve_geetest_captcha_params(
+    *,
+    device_host: str,
+    captcha_mode: str,
+    captcha_timeout: float,
+    captcha_id: str,
+    captcha_headed: bool,
+    context: str,
+    prefer_app: bool = False,
+) -> tuple[dict | None, str | None]:
+    cap_mode = (captcha_mode or "auto").strip().lower()
+    cap_timeout = captcha_timeout
+    cap_id = captcha_id
+
+    def capture_from_app(*, reuse_cached: bool = True) -> tuple[dict | None, str | None]:
+        from src.frida_client import peek_rpc_captcha, poll_captcha
+
+        if reuse_cached:
+            cached = peek_rpc_captcha(device_host=device_host)
+            if cached and cached.get("lot_number"):
+                print(
+                    f"[captcha] Reusing App-captured token ({context}) "
+                    f"lot_number={cached['lot_number'][:8]}…",
+                    flush=True,
+                )
+                return cached, None
+
+        print(
+            f"[captcha] 请在 iBox App 打开对应页面并点击购买/确认，完成验证码 ({context})",
+            flush=True,
+        )
+        print(f"[captcha] Waiting up to {cap_timeout:.0f} s for App captcha…", flush=True)
+        params = poll_captcha(
+            device_host=device_host,
+            timeout=cap_timeout,
+            clear_before=not reuse_cached,
+        )
+        if params:
+            print(
+                f"[captcha] Captured from app ✓  lot_number={params['lot_number'][:8]}…",
+                flush=True,
+            )
+            return params, None
+        return None, f"Captcha not obtained within {cap_timeout:.0f} s"
+
+    def solve_with_playwright(*, headed: bool) -> tuple[dict | None, str | None]:
+        try:
+            from src.geetest_solver import playwright_solve, check_dependencies
+
+            ok, msg = check_dependencies()
+            if not ok:
+                raise ImportError(msg)
+            print(
+                f"[captcha] Playwright GeeTest ({context}, headed={headed})…",
+                flush=True,
+            )
+            result = playwright_solve(
+                captcha_id=cap_id,
+                timeout=cap_timeout,
+                headed=headed,
+            )
+            if result and result.get("lot_number"):
+                print(
+                    f"[captcha] Auto-solved ✓  lot_number={result['lot_number'][:8]}…",
+                    flush=True,
+                )
+                return result, None
+            raise RuntimeError(f"Playwright returned empty result: {result}")
+        except Exception as exc:
+            print(f"[captcha] Playwright failed: {exc}", flush=True)
+            return None, str(exc)
+
+    if cap_mode in {"app", "manual"}:
+        return capture_from_app(reuse_cached=True)
+
+    if cap_mode == "skip":
+        return None, f"Captcha required for {context} but --captcha-mode=skip"
+
+    if cap_mode == "playwright":
+        result, err = solve_with_playwright(headed=captcha_headed)
+        if result:
+            return result, None
+        return None, err or "Playwright captcha solve failed"
+
+    # auto
+    if prefer_app:
+        result, err = capture_from_app(reuse_cached=True)
+        if result:
+            return result, None
+        # Headed browser is less likely to get click-captcha than headless.
+        result, pw_err = solve_with_playwright(headed=True)
+        if result:
+            return result, None
+        print("[captcha] Playwright unavailable/failed, waiting for App captcha…", flush=True)
+        return capture_from_app(reuse_cached=False)
+
+    result, err = solve_with_playwright(headed=captcha_headed)
+    if result:
+        return result, None
+    if cap_mode == "auto":
+        alt_headed = not captcha_headed
+        print(
+            f"[captcha] Retrying Playwright with headed={alt_headed}…",
+            flush=True,
+        )
+        result, err = solve_with_playwright(headed=alt_headed)
+        if result:
+            return result, None
+    if cap_mode == "auto":
+        print("[captcha] Falling back to App captcha capture…", flush=True)
+        return capture_from_app(reuse_cached=False)
+    return None, err or "Captcha solve failed"
+
+
 def build_synthesis_confirm_path(
     config: dict,
     uid: str,
@@ -1815,8 +3643,242 @@ def resolve_outer_activity_id(
     return outer_activity_id
 
 
+SYNTHESIS_DEFAULT_IDLE_INTERVAL_SEC = 30.0
+SYNTHESIS_DEFAULT_FAR_INTERVAL_SEC = 90.0
+
+
+def compute_synthesis_poll_interval(
+    *,
+    wait_target: datetime | None,
+    has_craftable: bool,
+    pre_start_window: float,
+    active_interval: float,
+    idle_interval: float,
+    far_interval: float,
+) -> float:
+    now = datetime.now()
+    if wait_target and wait_target > now:
+        seconds_until = (wait_target - now).total_seconds()
+        if seconds_until <= pre_start_window:
+            return max(0.3, min(active_interval, 1.0))
+        return min(far_interval, max(idle_interval, seconds_until - pre_start_window))
+    if has_craftable:
+        return max(0.3, active_interval)
+    return max(idle_interval, active_interval)
+
+
+def plan_synthesis_job(
+    center_result: dict,
+    synthetic_id: str,
+    remaining_target_count: int | None,
+) -> dict | None:
+    if not is_success(center_result):
+        return None
+    candidates = extract_recipe_candidates(center_result)
+    if not candidates:
+        return None
+    candidate = choose_recipe_candidate(candidates, str(synthetic_id))
+    max_times = int(candidate.get("max_times") or 0)
+    center_data = (center_result or {}).get("data") or {}
+    surplus_num = to_int(first_present(center_data, ("surplusNum", "remainNum", "leftNum")))
+    max_synthetic_num = to_int(first_present(center_data, ("maxSyntheticNum", "maxNum")))
+    server_cap = (
+        min(v for v in (surplus_num, max_synthetic_num) if v is not None)
+        if any(v is not None for v in (surplus_num, max_synthetic_num))
+        else None
+    )
+    if server_cap is not None and server_cap < max_times:
+        max_times = server_cap
+    if max_times <= 0:
+        return None
+    available_times = max_times
+    if remaining_target_count is not None:
+        max_times = min(max_times, remaining_target_count)
+    return {
+        "synthetic_id": str(synthetic_id),
+        "candidate": candidate,
+        "max_times": max_times,
+        "available_times_after_caps": available_times,
+        "material_state_signature": build_material_state_signature(candidate),
+        "center_result": center_result,
+    }
+
+
+def prioritize_synthesis_jobs(
+    jobs: list[dict],
+    *,
+    upcoming_ids: set[str],
+) -> list[dict]:
+    def sort_key(job: dict) -> tuple:
+        sid = str(job["synthetic_id"])
+        priority = 0 if sid in upcoming_ids else 1
+        return (priority, -(int(job.get("max_times") or 0)))
+
+    return sorted(jobs, key=sort_key)
+
+
+SYNTHESIS_BATCH_REPORT_REASONS = frozenset({
+    "no_materials",
+    "activity_ended",
+    "target_reached",
+})
+SYNTHESIS_STOP_LOOP_REASONS = frozenset({"target_reached"})
+
+
+def _synthesis_reward_name_from_row(row: dict) -> str:
+    name = first_present(row, ("groupName", "name", "collectionName", "title"))
+    return str(name).strip() if name not in (None, "") else ""
+
+
+def summarize_synthesis_batch_rewards(batch_submits: list[dict]) -> list[str]:
+    labels: list[str] = []
+    for item in batch_submits:
+        confirm = item.get("confirm") if isinstance(item, dict) else None
+        if not isinstance(confirm, dict):
+            continue
+        data = confirm.get("data")
+        rows = extract_list_payload(confirm) if isinstance(confirm, dict) else []
+        if not rows and isinstance(data, dict):
+            rows = data.get("list") or []
+        if not isinstance(rows, list):
+            continue
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            name = _synthesis_reward_name_from_row(row)
+            token_ids = row.get("tokenIds") or row.get("tokenId") or []
+            if isinstance(token_ids, list) and token_ids:
+                labels.append(f"{name}#{token_ids[0]}" if name else f"#{token_ids[0]}")
+            elif name:
+                labels.append(str(name))
+    return labels
+
+
+def summarize_synthesis_reward_totals(all_submits: list[dict]) -> list[dict]:
+    """Aggregate confirmed synthesis outputs by collection name."""
+    counts: dict[str, int] = {}
+    for item in all_submits:
+        times = max(1, int(item.get("times") or 1))
+        confirm = item.get("confirm") if isinstance(item, dict) else None
+        if not isinstance(confirm, dict):
+            continue
+        rows = extract_list_payload(confirm)
+        if not rows and isinstance(confirm.get("data"), dict):
+            rows = confirm["data"].get("list") or []
+        if not isinstance(rows, list) or not rows:
+            name = "未知藏品"
+            counts[name] = counts.get(name, 0) + times
+            continue
+        per_submit = max(1, len(rows))
+        share = max(1, times // per_submit)
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            name = _synthesis_reward_name_from_row(row) or "未知藏品"
+            counts[name] = counts.get(name, 0) + share
+    return [{"name": name, "count": count} for name, count in sorted(counts.items())]
+
+
+def report_synthesis_batch_complete(
+    *,
+    batch_no: int,
+    reason: str,
+    batch_submits: list[dict],
+    target_count: int | None,
+    total_submitted: int,
+    all_submits: list[dict] | None = None,
+    terminal: bool = False,
+) -> None:
+    batch_times = sum(int(item.get("times") or 1) for item in batch_submits)
+    rewards = summarize_synthesis_batch_rewards(batch_submits)
+    reward_totals = summarize_synthesis_reward_totals(all_submits or batch_submits)
+    payload = {
+        "batch": batch_no,
+        "reason": reason,
+        "batch_submitted_count": len(batch_submits),
+        "batch_times": batch_times,
+        "target_count": target_count,
+        "total_submitted": total_submitted,
+        "rewards": rewards,
+        "reward_totals": reward_totals,
+        "terminal": terminal,
+    }
+    print(f"[ibox-synthesis-batch] {json.dumps(payload, ensure_ascii=False)}", flush=True)
+
+
 def is_success(result: dict) -> bool:
     return isinstance(result, dict) and result.get("code") == 0
+
+
+def is_rate_limited(result: dict | None) -> bool:
+    if not isinstance(result, dict):
+        return False
+    message = str(result.get("message") or result.get("msg") or "")
+    if any(token in message for token in ("NullPointerException", "Exception", "Error")):
+        return False
+    if "过于频繁" in message:
+        return True
+    return str(result.get("code")) == "10002" and not message.strip()
+
+
+def client_get_with_rate_limit_retry(
+    client,
+    path: str,
+    *,
+    label: str = "GET",
+    max_attempts: int = 5,
+    base_delay: float = 2.0,
+    headers: dict | None = None,
+) -> tuple[dict | None, dict | None]:
+    delay = base_delay
+    last_result: dict | None = None
+    for attempt in range(1, max_attempts + 1):
+        result = client.get(path, headers=headers)
+        if is_success(result):
+            return result, None
+        last_result = result if isinstance(result, dict) else {"error": str(result)}
+        if is_rate_limited(last_result) and attempt < max_attempts:
+            print(
+                f"[rate-limit] {label} code={last_result.get('code')} "
+                f"message={last_result.get('message')} retry in {delay:.1f}s "
+                f"({attempt}/{max_attempts})",
+                flush=True,
+            )
+            time.sleep(delay)
+            delay = min(delay * 2, 30.0)
+            continue
+        break
+    return None, last_result
+
+
+def client_post_with_rate_limit_retry(
+    client,
+    path: str,
+    payload: dict,
+    *,
+    label: str = "POST",
+    max_attempts: int = 5,
+    base_delay: float = 2.0,
+) -> dict:
+    delay = base_delay
+    last_result: dict = {"code": 1, "error": "empty response"}
+    for attempt in range(1, max_attempts + 1):
+        result = client.post(path, payload)
+        if is_success(result):
+            return result
+        last_result = result if isinstance(result, dict) else {"error": str(result)}
+        if is_rate_limited(last_result) and attempt < max_attempts:
+            print(
+                f"[rate-limit] {label} code={last_result.get('code')} "
+                f"message={last_result.get('message')} retry in {delay:.1f}s "
+                f"({attempt}/{max_attempts})",
+                flush=True,
+            )
+            time.sleep(delay)
+            delay = min(delay * 2, 30.0)
+            continue
+        break
+    return last_result
 
 
 def should_retry_synthesis_submit(result: dict | None) -> bool:
@@ -1844,6 +3906,9 @@ def should_retry_synthesis_submit(result: dict | None) -> bool:
 def is_auth_failure(result: dict | None) -> bool:
     if not isinstance(result, dict):
         return False
+
+    if result.get("auth_failure"):
+        return True
 
     code = result.get("code")
     if str(code) in {"401", "403", "1001", "1002", "2001", "2002", "2003"}:
@@ -1897,6 +3962,11 @@ def uid_from_jwt(token: str) -> str | None:
 
 def extract_uid(login_result: dict) -> str | None:
     data = (login_result or {}).get("data") or {}
+    user_info = data.get("userInfo") or {}
+    if isinstance(user_info, dict):
+        value = user_info.get("userId")
+        if value not in (None, ""):
+            return str(value)
     for key in ("uid", "userId", "id"):
         value = data.get(key)
         if value not in (None, ""):
@@ -2133,12 +4203,14 @@ def main():
         "synthesis-auto",
         "synthesis-confirm",
         "market-buy",
+        "market-purchase",
         "consign-create",
         "consign-cancel",
         "purchase-detail",
         "wanted-detail",
         "wanted-deal",
         "wanted-buy",
+        "sale-rush",
         "api",
     }
     if cmd in rpc_only_commands:
@@ -2203,7 +4275,10 @@ def main():
                 sort_field=parsed.sort_field,
                 uid=uid,
             )
-            operation = lambda: client.get(path)
+            operation = lambda: client.get(
+                path,
+                headers=build_webview_api_headers(getattr(client, "token", None)),
+            )
         elif cmd == "purchase-orders":
             if not uid:
                 raise SystemExit("Error: uid is required for purchase-orders. Pass --uid or ensure login response contains uid")
@@ -2279,90 +4354,123 @@ def main():
             submit_path = render_command_path(config, "synthesis-submit", "/synthesis-service/synthetic/center/submit")
 
             def _get_captcha_params(synth_id: str) -> tuple[dict | None, str | None]:
-                cap_mode = parsed.captcha_mode
-                cap_timeout = parsed.captcha_timeout
-                cap_id = parsed.captcha_id
-
-                if cap_mode in ("auto", "playwright"):
-                    try:
-                        from src.geetest_solver import playwright_solve, check_dependencies
-                        ok, msg = check_dependencies()
-                        if not ok:
-                            raise ImportError(msg)
-                        print(f"[captcha] Auto-solving GeeTest V4 (synthetic_id={synth_id})…", flush=True)
-                        result = playwright_solve(
-                            captcha_id=cap_id,
-                            timeout=cap_timeout,
-                            headed=getattr(parsed, "captcha_headed", False),
-                        )
-                        if result and result.get("lot_number"):
-                            print(f"[captcha] Auto-solved ✓  lot_number={result['lot_number'][:8]}…", flush=True)
-                            return result, None
-                        raise RuntimeError(f"Playwright returned empty result: {result}")
-                    except Exception as exc:
-                        print(f"[captcha] Auto-solve failed: {exc}", flush=True)
-                        if cap_mode == "playwright":
-                            return None, f"Playwright captcha solve failed: {exc}"
-                        print("[captcha] Falling back to manual mode…", flush=True)
-
-                if cap_mode == "skip":
-                    return None, "Captcha required (needSlider=1) but --captcha-mode=skip"
-
-                print(
-                    f"[captcha] Please solve the GeeTest slider captcha in the iBox app "
-                    f"(synthetic_id={synth_id})",
-                    flush=True,
-                )
-                print(f"[captcha] Waiting up to {cap_timeout:.0f} s for captcha result…", flush=True)
-                from src.frida_client import poll_captcha
-                params = poll_captcha(
+                return resolve_geetest_captcha_params(
                     device_host=device_host,
-                    timeout=cap_timeout,
-                    clear_before=True,
+                    captcha_mode=parsed.captcha_mode,
+                    captcha_timeout=parsed.captcha_timeout,
+                    captcha_id=parsed.captcha_id,
+                    captcha_headed=getattr(parsed, "captcha_headed", False),
+                    context=f"synthetic_id={synth_id}",
                 )
-                if params:
-                    print(f"[captcha] Captured from app ✓  lot_number={params['lot_number'][:8]}…", flush=True)
-                    return params, None
-                return None, f"Captcha not obtained within {cap_timeout:.0f} s"
 
             def synthesis_auto_operation():
-                cycles = []
-                successful_submits = []
+                continuous = not parsed.once
+                idle_interval = max(float(parsed.idle_interval), 1.0)
+                far_interval = max(float(parsed.far_interval), idle_interval)
+                cycles: list[dict] = []
+                successful_submits: list[dict] = []
+                current_batch_submits: list[dict] = []
                 successful_state_by_synthetic_id: dict[str, tuple] = {}
                 remaining_target_count = parsed.target_count
                 last_activity_list_result = None
                 last_activity_details: list[dict] = []
                 last_synthetic_ids: list[str] = []
                 cycle_no = 0
+                batch_no = 0
+                last_had_craftable = False
+
+                def finish_batch(reason: str) -> bool:
+                    nonlocal batch_no, remaining_target_count, current_batch_submits
+                    nonlocal successful_state_by_synthetic_id
+                    if not current_batch_submits and reason not in SYNTHESIS_BATCH_REPORT_REASONS:
+                        return continuous
+                    batch_no += 1
+                    stop_loop = reason in SYNTHESIS_STOP_LOOP_REASONS
+                    if not continuous and reason in SYNTHESIS_BATCH_REPORT_REASONS:
+                        stop_loop = True
+                    report_synthesis_batch_complete(
+                        batch_no=batch_no,
+                        reason=reason,
+                        batch_submits=list(current_batch_submits),
+                        target_count=parsed.target_count,
+                        total_submitted=len(successful_submits),
+                        all_submits=list(successful_submits),
+                        terminal=stop_loop,
+                    )
+                    current_batch_submits = []
+                    successful_state_by_synthetic_id.clear()
+                    if parsed.target_count is not None:
+                        remaining_target_count = parsed.target_count
+                    if stop_loop:
+                        print(
+                            f"[synthesis-auto] batch complete ({reason}); stopping.",
+                            flush=True,
+                        )
+                        return False
+                    print(
+                        f"[synthesis-auto] batch complete ({reason}); "
+                        "continuing to monitor for the next synthesis activity…",
+                        flush=True,
+                    )
+                    return True
 
                 while True:
                     cycle_no += 1
                     if parsed.max_rounds > 0 and cycle_no > parsed.max_rounds:
-                        print(f"[cycle {cycle_no - 1}] Reached --max-rounds={parsed.max_rounds}, stopping.", flush=True)
-                        break
-                    if remaining_target_count is not None and remaining_target_count <= 0:
-                        print(f"[cycle {cycle_no}] Target count reached, stopping.", flush=True)
+                        print(
+                            f"[cycle {cycle_no - 1}] Reached --max-rounds={parsed.max_rounds}, stopping.",
+                            flush=True,
+                        )
                         break
 
                     print(f"[cycle {cycle_no}] Fetching latest synthesis activities…", flush=True)
                     activity_list_result = client.get_synthesis_activity_list(activity_list_path)
                     last_activity_list_result = activity_list_result
                     if not is_success(activity_list_result):
+                        if is_auth_failure(activity_list_result):
+                            print(
+                                f"[cycle {cycle_no}] activity-list auth failed "
+                                f"({activity_list_result.get('code')}), stopping.",
+                                flush=True,
+                            )
+                            return activity_list_result
+                        retry_in = compute_synthesis_poll_interval(
+                            wait_target=None,
+                            has_craftable=False,
+                            pre_start_window=parsed.pre_start_window,
+                            active_interval=parsed.loop_interval,
+                            idle_interval=idle_interval,
+                            far_interval=far_interval,
+                        )
                         print(
                             f"[cycle {cycle_no}] activity-list failed ({activity_list_result.get('code')}), "
-                            f"retry in {parsed.loop_interval:.1f}s…",
+                            f"retry in {retry_in:.1f}s…",
                             flush=True,
                         )
-                        time.sleep(max(parsed.loop_interval, 0.1))
+                        time.sleep(retry_in)
                         continue
 
                     activity_ids = extract_activity_ids(activity_list_result)
                     if not activity_ids:
+                        if successful_submits or batch_no > 0 or current_batch_submits:
+                            if not finish_batch("activity_ended"):
+                                break
+                        if not continuous:
+                            break
+                        retry_in = compute_synthesis_poll_interval(
+                            wait_target=None,
+                            has_craftable=False,
+                            pre_start_window=parsed.pre_start_window,
+                            active_interval=parsed.loop_interval,
+                            idle_interval=idle_interval,
+                            far_interval=far_interval,
+                        )
                         print(
-                            f"[cycle {cycle_no}] No activities found, retry in {parsed.loop_interval:.1f}s…",
+                            f"[cycle {cycle_no}] No synthesis activities, waiting for next; "
+                            f"retry in {retry_in:.1f}s…",
                             flush=True,
                         )
-                        time.sleep(max(parsed.loop_interval, 0.1))
+                        time.sleep(retry_in)
                         continue
 
                     activity_details = fetch_synthesis_activity_details_parallel(
@@ -2379,13 +4487,33 @@ def main():
                         parsed.pre_start_window,
                     )
                     last_synthetic_ids = synthetic_ids
+                    upcoming_ids: set[str] = set()
+                    pre_ids, _, earliest_start = extract_upcoming_synthetic_ids_with_start(activity_details)
+                    if pre_ids and earliest_start is not None:
+                        seconds_until = (earliest_start - datetime.now()).total_seconds()
+                        if 0 < seconds_until <= parsed.pre_start_window:
+                            active_set: set[str] = set()
+                            for item in activity_details:
+                                detail = item.get("detail")
+                                if is_success(detail):
+                                    active_set.update(extract_synthetic_ids(detail))
+                            filtered = {sid for sid in pre_ids if sid not in active_set}
+                            upcoming_ids = filtered or set(pre_ids)
 
                     if not synthetic_ids:
+                        retry_in = compute_synthesis_poll_interval(
+                            wait_target=wait_target,
+                            has_craftable=False,
+                            pre_start_window=parsed.pre_start_window,
+                            active_interval=parsed.loop_interval,
+                            idle_interval=idle_interval,
+                            far_interval=far_interval,
+                        )
                         print(
-                            f"[cycle {cycle_no}] No synthetic ids discovered, retry in {parsed.loop_interval:.1f}s…",
+                            f"[cycle {cycle_no}] No synthetic ids discovered, retry in {retry_in:.1f}s…",
                             flush=True,
                         )
-                        time.sleep(max(parsed.loop_interval, 0.1))
+                        time.sleep(retry_in)
                         continue
 
                     pre_center_cache: dict[str, dict] = {}
@@ -2407,86 +4535,89 @@ def main():
                         pre_center_cache=pre_center_cache,
                     )
 
-                    cycle_entries = []
-                    cycle_progress = False
-                    any_craftable = False
+                    craftable_jobs: list[dict] = []
+                    cycle_entries: list[dict] = []
                     for synthetic_id in synthetic_ids:
+                        center_result = center_results.get(str(synthetic_id), {})
+                        entry = {"synthetic_id": synthetic_id, "center": center_result}
+                        job = plan_synthesis_job(
+                            center_result,
+                            synthetic_id,
+                            remaining_target_count,
+                        )
+                        if job is None:
+                            if is_success(center_result):
+                                entry["code"] = 0
+                                entry["message"] = "Current materials are insufficient for this recipe."
+                            else:
+                                entry["code"] = center_result.get("code", 1)
+                            cycle_entries.append(entry)
+                            continue
+                        job["center_result"] = center_result
+                        craftable_jobs.append(job)
+                        entry["plan"] = summarize_synthesis_plan(job["candidate"], job["max_times"])
+                        entry["code"] = 0
+                        cycle_entries.append(entry)
+
+                    craftable_jobs = prioritize_synthesis_jobs(
+                        craftable_jobs,
+                        upcoming_ids=upcoming_ids,
+                    )
+                    any_craftable = bool(craftable_jobs)
+
+                    if not any_craftable:
+                        if last_had_craftable or current_batch_submits:
+                            if not finish_batch("no_materials"):
+                                break
+                        last_had_craftable = False
+                        retry_in = compute_synthesis_poll_interval(
+                            wait_target=wait_target,
+                            has_craftable=False,
+                            pre_start_window=parsed.pre_start_window,
+                            active_interval=parsed.loop_interval,
+                            idle_interval=idle_interval,
+                            far_interval=far_interval,
+                        )
+                        print(
+                            f"[cycle {cycle_no}] No craftable recipes in wallet, retry in {retry_in:.1f}s…",
+                            flush=True,
+                        )
+                        if not continuous:
+                            break
+                        time.sleep(retry_in)
+                        cycles.append({"cycle": cycle_no, "entries": cycle_entries})
+                        continue
+
+                    last_had_craftable = True
+                    if upcoming_ids:
+                        print(
+                            f"[cycle {cycle_no}] prioritizing {len(upcoming_ids)} upcoming synthetic id(s)",
+                            flush=True,
+                        )
+
+                    cycle_progress = False
+                    stop_after_batch = False
+                    for job in craftable_jobs:
                         if remaining_target_count is not None and remaining_target_count <= 0:
+                            if not finish_batch("target_reached"):
+                                stop_after_batch = True
                             break
 
-                        center_result = center_results.get(str(synthetic_id), {})
-                        if str(synthetic_id) in pre_center_cache:
-                            print(
-                                f"[cycle {cycle_no}] using pre-fetched center for synthetic_id={synthetic_id}",
-                                flush=True,
-                            )
-                        entry = {
-                            "synthetic_id": synthetic_id,
-                            "center": center_result,
-                        }
-                        if not is_success(center_result):
-                            entry["code"] = center_result.get("code", 1)
-                            cycle_entries.append(entry)
-                            continue
-
-                        candidates = extract_recipe_candidates(center_result)
-                        if not candidates:
-                            entry["code"] = 1
-                            entry["error"] = "Could not derive synthesis materials from synthesis-center response."
-                            cycle_entries.append(entry)
-                            continue
-
-                        candidate = choose_recipe_candidate(candidates, synthetic_id)
-                        max_times = candidate.get("max_times", 0)
-                        center_data = (center_result or {}).get("data") or {}
-                        surplus_num = to_int(first_present(center_data, ("surplusNum", "remainNum", "leftNum")))
-                        max_synthetic_num = to_int(first_present(center_data, ("maxSyntheticNum", "maxNum")))
-                        server_cap = (
-                            min(v for v in (surplus_num, max_synthetic_num) if v is not None)
-                            if any(v is not None for v in (surplus_num, max_synthetic_num))
-                            else None
-                        )
-                        if server_cap is not None and server_cap < max_times:
-                            max_times = server_cap
-                        material_state_signature = build_material_state_signature(candidate)
-
-                        if max_times <= 0:
-                            entry["plan"] = summarize_synthesis_plan(candidate, max_times)
-                            entry["code"] = 0
-                            entry["message"] = "Current materials are insufficient for this recipe."
-                            cycle_entries.append(entry)
-                            continue
-
-                        any_craftable = True
-                        available_times = max_times
-                        if remaining_target_count is not None:
-                            max_times = min(max_times, remaining_target_count)
-                        plan = summarize_synthesis_plan(candidate, max_times)
-                        plan["available_times_after_caps"] = available_times
-                        if remaining_target_count is not None:
-                            plan["target_count_remaining_before"] = remaining_target_count
-                        entry["plan"] = plan
+                        synthetic_id = job["synthetic_id"]
+                        candidate = job["candidate"]
+                        max_times = job["max_times"]
+                        material_state_signature = job["material_state_signature"]
+                        center_result = job["center_result"]
 
                         previous_success_state = successful_state_by_synthetic_id.get(str(synthetic_id))
                         if previous_success_state == material_state_signature:
-                            entry["code"] = 0
-                            entry["submitted"] = False
-                            entry["message"] = (
-                                "Skipping repeated submit because the material snapshot is unchanged "
-                                "after a previous successful submission."
-                            )
-                            cycle_entries.append(entry)
                             continue
 
                         payload = build_synthesis_submit_payload(candidate, synthetic_id, max_times)
-                        entry["payload"] = payload
                         if parsed.dry_run:
-                            entry["code"] = 0
-                            entry["submitted"] = False
-                            cycle_entries.append(entry)
+                            cycle_progress = True
                             if remaining_target_count is not None:
                                 remaining_target_count -= max_times
-                            cycle_progress = True
                             continue
 
                         print(
@@ -2503,13 +4634,8 @@ def main():
                             concurrency=parsed.submit_concurrency,
                         )
                         submit_result = submit_outcome["result"]
-                        entry["submit"] = submit_result
-                        entry["submit_attempts"] = submit_outcome["attempts"]
-                        entry["attempt_count"] = submit_outcome["attempt_count"]
-                        entry["submit_concurrency"] = submit_outcome["concurrency"]
-                        entry["code"] = submit_result.get("code", 0 if is_success(submit_result) else 1)
-
                         confirmed = False
+                        confirm_result = None
                         if is_success(submit_result):
                             need_slider = synthesis_needs_slider(center_result)
                             outer_activity_id = resolve_outer_activity_id(
@@ -2520,8 +4646,7 @@ def main():
                             if need_slider:
                                 captcha_params, captcha_err = _get_captcha_params(str(synthetic_id))
                                 if captcha_err:
-                                    entry["captcha_error"] = captcha_err
-                                    entry["code"] = 1
+                                    print(f"[cycle {cycle_no}] captcha error: {captcha_err}", flush=True)
                                 else:
                                     confirm_path = build_synthesis_confirm_path(
                                         config,
@@ -2539,9 +4664,7 @@ def main():
                                         flush=True,
                                     )
                                     confirm_result = client.confirm_synthesis(confirm_path, confirm_body)
-                                    entry["confirm"] = confirm_result
                                     confirmed = is_success(confirm_result)
-                                    entry["code"] = 0 if confirmed else confirm_result.get("code", 1)
                             else:
                                 confirm_path = build_synthesis_confirm_path(config, uid or "")
                                 confirm_body = build_synthesis_confirm_body(
@@ -2555,46 +4678,64 @@ def main():
                                     flush=True,
                                 )
                                 confirm_result = client.confirm_synthesis(confirm_path, confirm_body)
-                                entry["confirm"] = confirm_result
                                 confirmed = is_success(confirm_result)
-                                entry["code"] = 0 if confirmed else confirm_result.get("code", 1)
-
-                        cycle_entries.append(entry)
 
                         if confirmed:
                             cycle_progress = True
                             if remaining_target_count is not None:
                                 remaining_target_count -= max_times
                             successful_state_by_synthetic_id[str(synthetic_id)] = material_state_signature
-                            successful_submits.append(
-                                {
-                                    "cycle": cycle_no,
-                                    "synthetic_id": synthetic_id,
-                                    "times": max_times,
-                                    "attempt_count": submit_outcome["attempt_count"],
-                                    "submit_concurrency": submit_outcome["concurrency"],
-                                    "submit": submit_result,
-                                    **({"confirm": entry["confirm"]} if "confirm" in entry else {}),
-                                }
-                            )
+                            submit_record = {
+                                "cycle": cycle_no,
+                                "synthetic_id": synthetic_id,
+                                "times": max_times,
+                                "attempt_count": submit_outcome["attempt_count"],
+                                "submit_concurrency": submit_outcome["concurrency"],
+                                "submit": submit_result,
+                                "confirm": confirm_result,
+                            }
+                            successful_submits.append(submit_record)
+                            current_batch_submits.append(submit_record)
+                            if parsed.target_count is not None:
+                                submitted_qty = sum(
+                                    item.get("times", 1) for item in current_batch_submits
+                                )
+                                report_task_progress(submitted_qty, parsed.target_count)
+                            if remaining_target_count is not None and remaining_target_count <= 0:
+                                if not finish_batch("target_reached"):
+                                    stop_after_batch = True
+                                break
 
                     cycles.append({"cycle": cycle_no, "entries": cycle_entries})
 
                     if parsed.dry_run:
                         break
-                    if remaining_target_count is not None and remaining_target_count <= 0:
+                    if stop_after_batch:
                         break
-                    if not any_craftable:
-                        print(f"[cycle {cycle_no}] No craftable recipes left, synthesis complete.", flush=True)
-                        break
+                    if not continuous:
+                        if remaining_target_count is not None and remaining_target_count <= 0:
+                            break
+                        if not any_craftable:
+                            break
+
+                    retry_in = compute_synthesis_poll_interval(
+                        wait_target=wait_target,
+                        has_craftable=any_craftable,
+                        pre_start_window=parsed.pre_start_window,
+                        active_interval=parsed.loop_interval,
+                        idle_interval=idle_interval,
+                        far_interval=far_interval,
+                    )
                     if cycle_progress:
+                        if retry_in > 0:
+                            time.sleep(min(retry_in, parsed.loop_interval))
                         continue
                     print(
                         f"[cycle {cycle_no}] Craftable items remain but submit did not succeed, "
-                        f"retry in {parsed.loop_interval:.1f}s…",
+                        f"retry in {retry_in:.1f}s…",
                         flush=True,
                     )
-                    time.sleep(max(parsed.loop_interval, 0.1))
+                    time.sleep(retry_in)
 
                 any_discovered_craftable = any(
                     (entry.get("plan") or {}).get("max_times", 0) > 0
@@ -2603,6 +4744,8 @@ def main():
                 )
                 return {
                     "code": 0 if parsed.dry_run or successful_submits or not any_discovered_craftable else 1,
+                    "continuous": continuous,
+                    "batch_count": batch_no,
                     "activity_list": last_activity_list_result,
                     "activity_details": last_activity_details,
                     "synthetic_ids": last_synthetic_ids,
@@ -2611,6 +4754,7 @@ def main():
                     "remaining_target_count": remaining_target_count,
                     "submitted_count": len(successful_submits),
                     "submitted": successful_submits,
+                    "reward_totals": summarize_synthesis_reward_totals(successful_submits),
                 }
 
             operation = synthesis_auto_operation
@@ -2635,44 +4779,432 @@ def main():
         elif cmd == "market-buy":
             if not uid:
                 raise SystemExit("Error: uid is required for market-buy. Pass --uid or ensure login response contains uid")
-            path = render_command_path(
-                config,
-                "market-buy",
-                "/order-create-service/batch-purchase-consignment-orders?uid={uid}",
-                uid=uid,
-            )
             collection_name = (parsed.collection_name or "").strip()
             extra_payload = parse_payload_arg(parsed.payload) or {}
             if collection_name and parsed.price is not None:
-                group_id = resolve_group_id_for_market(client, collection_name, config)
-                if isinstance(group_id, dict):
-                    operation = lambda: group_id
-                else:
-                    payment_platform = (
-                        parsed.payment_platform
-                        if parsed.payment_platform is not None
-                        else int(get_command_default(config, "market-buy", "payment_platform_code", "30"))
+                if not (parsed.consignment_password or "").strip():
+                    raise SystemExit("Error: market-buy requires --支付密码")
+                buy_qty = max(1, int(parsed.quantity))
+                list_pages = max(1, int(parsed.list_pages or 10))
+                poll_interval = parsed.poll_interval
+                if poll_interval is None:
+                    poll_interval = float(
+                        get_command_default(
+                            config,
+                            "market-buy",
+                            "poll_interval",
+                            str(MARKET_BUY_DEFAULT_POLL_INTERVAL_SEC),
+                        )
                     )
-                    payload = build_market_buy_payload(
-                        group_id,
-                        parsed.price,
-                        parsed.quantity,
-                        payment_platform,
-                        extra=extra_payload,
+                poll_interval = max(0.5, float(poll_interval))
+                payment_platform = (
+                    parsed.payment_platform
+                    if parsed.payment_platform is not None
+                    else int(get_command_default(config, "market-buy", "payment_platform_code", "30"))
+                )
+                purchase_path = render_command_path(
+                    config,
+                    "market-buy",
+                    "/order-create-service/purchase-consignment-orders?uid={uid}",
+                    uid=uid,
+                )
+
+                def market_buy_operation():
+                    group_id = resolve_group_id_for_market(client, collection_name, config)
+                    if isinstance(group_id, dict):
+                        return group_id
+                    ibox_token = getattr(client, "token", None) or (
+                        (saved_session or {}).get("token") if saved_session else None
                     )
-                    print(
-                        f"[market-buy] group_id={group_id} maxSinglePrice={payload['maxSinglePrice']}fen "
-                        f"maxCount={payload['maxCount']}",
-                        flush=True,
+                    return run_market_buy_sweep(
+                        client=client,
+                        config=config,
+                        uid=uid,
+                        group_id=group_id,
+                        collection_name=collection_name,
+                        target_price_yuan=float(parsed.price),
+                        target_qty=buy_qty,
+                        consignment_password=parsed.consignment_password,
+                        payment_platform=payment_platform,
+                        purchase_path=purchase_path,
+                        extra_payload=extra_payload,
+                        ibox_token=str(ibox_token or ""),
+                        app_version=app_version,
+                        list_pages=list_pages,
+                        poll_interval=poll_interval,
                     )
-                    operation = lambda: client.post(path, payload)
+
+                operation = market_buy_operation
             else:
+                path = render_command_path(
+                    config,
+                    "market-buy",
+                    "/order-create-service/batch-purchase-consignment-orders?uid={uid}",
+                    uid=uid,
+                )
                 payload = extra_payload
                 if not payload:
                     raise SystemExit(
-                        "Error: market-buy requires --collection-name + --price, or --payload"
+                        "Error: market-buy requires --collection-name + --price + --支付密码, or --payload"
                     )
                 operation = lambda: client.post(path, payload)
+        elif cmd == "market-purchase":
+            if not uid:
+                raise SystemExit(
+                    "Error: uid is required for market-purchase. Pass --uid or ensure login response contains uid"
+                )
+            collection_name = (parsed.collection_name or "").strip()
+            if not collection_name:
+                raise SystemExit("Error: market-purchase requires --collection-name")
+            if not (parsed.consignment_password or "").strip():
+                raise SystemExit("Error: market-purchase requires --支付密码")
+            extra_payload = parse_payload_arg(parsed.payload) or {}
+            payment_platform = (
+                parsed.payment_platform
+                if parsed.payment_platform is not None
+                else int(get_command_default(config, "market-purchase", "payment_platform_code", "30"))
+            )
+            purchase_path = render_command_path(
+                config,
+                "market-purchase",
+                "/order-create-service/purchase-consignment-orders?uid={uid}",
+                uid=uid,
+            )
+            seller_uid = (parsed.seller_uid or "").strip()
+            consign_order_id = (parsed.consign_order_id or "").strip()
+            digital_collection_id = (parsed.digital_collection_id or "").strip()
+            list_pages = max(1, int(parsed.list_pages or 10))
+            buy_qty = max(1, int(parsed.quantity))
+            target_price_yuan = float(parsed.price)
+            target_price_fen = int(round(target_price_yuan * 100))
+
+            def market_purchase_operation():
+                group_id = resolve_group_id_for_market(client, collection_name, config)
+                if isinstance(group_id, dict):
+                    return group_id
+
+                ibox_token = getattr(client, "token", None) or (
+                    (saved_session or {}).get("token") if saved_session else None
+                )
+
+                print(
+                    f"[market-purchase] group_id={group_id} price={target_price_yuan}yuan "
+                    f"quantity={buy_qty} consign_order_id={consign_order_id or 'any'} "
+                    f"digital_collection_id={digital_collection_id or '-'}",
+                    flush=True,
+                )
+
+                results: list[dict] = []
+                success_count = 0
+                fail_count = 0
+
+                def finalize_purchase(
+                    *,
+                    consign_id: str,
+                    create_result: dict,
+                    seller: str | None = None,
+                    dc_id: str | None = None,
+                ) -> dict:
+                    payment = complete_purchase_payment(
+                        client,
+                        create_result=create_result,
+                        consignment_password=parsed.consignment_password,
+                        ibox_token=str(ibox_token or ""),
+                        app_version=app_version,
+                        max_price_yuan=target_price_yuan,
+                        config=config,
+                    )
+                    paid = bool(payment.get("paid"))
+                    return {
+                        "consign_order_id": consign_id,
+                        "seller_uid": seller,
+                        "digital_collection_id": dc_id,
+                        "ok": paid,
+                        "paid": paid,
+                        "purchase_order_id": payment.get("purchase_order_id"),
+                        "cashierLink": payment.get("cashierLink"),
+                        "create": create_result,
+                        "payment": payment,
+                        "result": create_result if paid else payment,
+                    }
+
+                purchase_refs = parse_consign_purchase_ref_list(consign_order_id, digital_collection_id)
+                if purchase_refs:
+                    if len(purchase_refs) > buy_qty:
+                        purchase_refs = purchase_refs[:buy_qty]
+                    missing_dc = [order_id for order_id, dc_id in purchase_refs if not dc_id]
+                    if missing_dc:
+                        return {
+                            "code": 1,
+                            "error": (
+                                "direct purchase requires digitalCollectionId for each listing. "
+                                "Use orderId|藏品ID format from consign reply."
+                            ),
+                            "group_id": group_id,
+                            "missing": missing_dc[:5],
+                        }
+                    direct_total = len(purchase_refs)
+                    print(
+                        f"[market-purchase] direct batch purchase count={direct_total}",
+                        flush=True,
+                    )
+                    for index, (ref_order_id, ref_dc_id) in enumerate(purchase_refs, start=1):
+                        if index > 1 and CONSIGN_POST_INTERVAL_SEC > 0:
+                            time.sleep(CONSIGN_POST_INTERVAL_SEC)
+                        print(
+                            f"[market-purchase] buying {index}/{direct_total} "
+                            f"consignOrderId={ref_order_id} digitalCollectionId={ref_dc_id}",
+                            flush=True,
+                        )
+                        payload = build_market_purchase_payload(
+                            ref_order_id,
+                            payment_platform,
+                            parsed.consignment_password,
+                            digital_collection_id=ref_dc_id,
+                            extra=extra_payload,
+                        )
+                        direct_result = client_post_with_rate_limit_retry(
+                            client,
+                            purchase_path,
+                            payload,
+                            label=f"market-purchase direct {index}/{direct_total}",
+                        )
+                        if is_success(direct_result):
+                            entry = finalize_purchase(
+                                consign_id=ref_order_id,
+                                create_result=direct_result,
+                                dc_id=ref_dc_id,
+                            )
+                            ok = entry["ok"]
+                        else:
+                            ok = False
+                            print(
+                                f"[market-purchase] failed consignOrderId={ref_order_id}: "
+                                f"code={direct_result.get('code')} message={direct_result.get('message')}",
+                                flush=True,
+                            )
+                            entry = {
+                                "consign_order_id": ref_order_id,
+                                "digital_collection_id": ref_dc_id,
+                                "ok": False,
+                                "paid": False,
+                                "result": direct_result,
+                            }
+                        if ok:
+                            success_count += 1
+                        else:
+                            fail_count += 1
+                        results.append(entry)
+                        report_task_progress(index, direct_total)
+
+                    if direct_total > 1 or success_count > 0 or fail_count == 0:
+                        summary = (
+                            f"{collection_name}点对点购买已完成，购买个数：{success_count}，失败个数：{fail_count}"
+                        )
+                        print(summary, flush=True)
+                        return {
+                            "code": 0 if fail_count == 0 else 1,
+                            "message": summary,
+                            "summary": summary,
+                            "collectionName": collection_name,
+                            "successCount": success_count,
+                            "failCount": fail_count,
+                            "group_id": group_id,
+                            "mode": "direct",
+                            "results": results,
+                        }
+                    ref_order_id, ref_dc_id = purchase_refs[0]
+                    print(
+                        f"[market-purchase] direct purchase failed for "
+                        f"consignOrderId={ref_order_id}; falling back to market list",
+                        flush=True,
+                    )
+                    consign_order_id = ref_order_id
+                    digital_collection_id = ref_dc_id
+                    success_count = 0
+                    fail_count = 0
+                    results = []
+
+                single_order_id, single_dc_id = split_consign_purchase_ref(
+                    consign_order_id,
+                    digital_collection_id,
+                )
+                if single_order_id and single_dc_id and not purchase_refs:
+                    print(
+                        f"[market-purchase] trying direct purchase "
+                        f"consignOrderId={single_order_id} digitalCollectionId={single_dc_id}",
+                        flush=True,
+                    )
+                    payload = build_market_purchase_payload(
+                        single_order_id,
+                        payment_platform,
+                        parsed.consignment_password,
+                        digital_collection_id=single_dc_id,
+                        extra=extra_payload,
+                    )
+                    direct_result = client_post_with_rate_limit_retry(
+                        client,
+                        purchase_path,
+                        payload,
+                        label="market-purchase direct",
+                    )
+                    if is_success(direct_result):
+                        entry = finalize_purchase(
+                            consign_id=single_order_id,
+                            create_result=direct_result,
+                            dc_id=single_dc_id,
+                        )
+                        if entry["ok"]:
+                            success_count = 1
+                        else:
+                            fail_count = 1
+                        return {
+                            "code": 0 if entry["ok"] else 1,
+                            "collectionName": collection_name,
+                            "successCount": success_count,
+                            "failCount": fail_count,
+                            "group_id": group_id,
+                            "consign_order_id": single_order_id,
+                            "mode": "direct",
+                            "paid": entry.get("paid", False),
+                            "hint": (entry.get("payment") or {}).get("hint"),
+                            "results": [entry],
+                        }
+                    print(
+                        f"[market-purchase] direct purchase failed "
+                        f"code={direct_result.get('code')} message={direct_result.get('message')}; "
+                        "falling back to market list",
+                        flush=True,
+                    )
+                    consign_order_id = single_order_id
+
+                listings, list_error = fetch_group_market_listings(
+                    client,
+                    config,
+                    group_id,
+                    uid,
+                    max_pages=list_pages,
+                )
+                if listings is None:
+                    listings = []
+                if not listings and list_error:
+                    detail = ""
+                    if isinstance(list_error, dict):
+                        detail = f" (API code={list_error.get('code')} message={list_error.get('message')})"
+                    return {
+                        "code": 1,
+                        "error": f"failed to list market consignments for group {group_id}{detail}",
+                        "group_id": group_id,
+                    }
+
+                selected = select_market_listings(
+                    listings or [],
+                    price_fen=target_price_fen,
+                    quantity=buy_qty,
+                    seller_uid=seller_uid,
+                    consign_order_id=consign_order_id,
+                    exact_price=True,
+                )
+                if not selected:
+                    hint = f"price={target_price_yuan}yuan"
+                    if consign_order_id:
+                        hint += f", consign_order_id={consign_order_id}"
+                    elif seller_uid:
+                        hint += f", seller_uid={seller_uid}"
+                    error = (
+                        f"no matching consignment listings for {collection_name!r} ({hint}). "
+                        f"Ask seller to consign first, then retry with the consign order id."
+                    )
+                    if consign_order_id:
+                        error += " Direct purchase with the consign order id also failed."
+                    return {
+                        "code": 1,
+                        "error": error,
+                        "group_id": group_id,
+                        "scanned": len(listings or []),
+                    }
+                if len(selected) < buy_qty:
+                    return {
+                        "code": 1,
+                        "error": (
+                            f"need {buy_qty} listing(s) at {target_price_yuan}yuan, "
+                            f"only {len(selected)} matched"
+                        ),
+                        "group_id": group_id,
+                        "matched": len(selected),
+                    }
+
+                for index, entry in enumerate(selected[:buy_qty], start=1):
+                    if index > 1 and CONSIGN_POST_INTERVAL_SEC > 0:
+                        time.sleep(CONSIGN_POST_INTERVAL_SEC)
+                    order_id = entry["consign_order_id"]
+                    payload = build_market_purchase_payload(
+                        order_id,
+                        payment_platform,
+                        parsed.consignment_password,
+                        digital_collection_id=entry.get("digital_collection_id") or "",
+                        extra=extra_payload,
+                    )
+                    print(
+                        f"[market-purchase] buying {index}/{buy_qty} consignOrderId={order_id} "
+                        f"seller_uid={entry.get('seller_uid') or '-'}",
+                        flush=True,
+                    )
+                    result = client_post_with_rate_limit_retry(
+                        client,
+                        purchase_path,
+                        payload,
+                        label=f"market-purchase {index}/{buy_qty}",
+                    )
+                    listing = entry
+                    if is_success(result):
+                        purchase_entry = finalize_purchase(
+                            consign_id=order_id,
+                            create_result=result,
+                            seller=listing.get("seller_uid"),
+                            dc_id=listing.get("digital_collection_id"),
+                        )
+                        ok = purchase_entry["ok"]
+                    else:
+                        ok = False
+                        print(
+                            f"[market-purchase] failed consignOrderId={order_id}: "
+                            f"code={result.get('code')} message={result.get('message')}",
+                            flush=True,
+                        )
+                        purchase_entry = {
+                            "consign_order_id": order_id,
+                            "seller_uid": listing.get("seller_uid"),
+                            "digital_collection_id": listing.get("digital_collection_id"),
+                            "ok": False,
+                            "paid": False,
+                            "result": result,
+                        }
+                    if ok:
+                        success_count += 1
+                    else:
+                        fail_count += 1
+                    results.append(purchase_entry)
+                    report_task_progress(index, buy_qty)
+
+                summary = (
+                    f"{collection_name}点对点购买已完成，购买个数：{success_count}，失败个数：{fail_count}"
+                )
+                print(summary, flush=True)
+                return {
+                    "code": 0 if fail_count == 0 else 1,
+                    "message": summary,
+                    "summary": summary,
+                    "collectionName": collection_name,
+                    "successCount": success_count,
+                    "failCount": fail_count,
+                    "group_id": group_id,
+                    "seller_uid": seller_uid or None,
+                    "price_yuan": target_price_yuan,
+                    "results": results,
+                }
+
+            operation = market_purchase_operation
         elif cmd == "consign-create":
             consign_path = render_command_path(
                 config,
@@ -2738,11 +5270,19 @@ def main():
                     }
 
                 qty = max(1, int(parsed.quantity))
-                item_ids = list_unlocked_digital_collection_ids(client, group_id, limit=qty)
+                item_ids, list_error = list_unlocked_digital_collection_ids(client, group_id, limit=qty)
                 if item_ids is None:
+                    detail = ""
+                    if isinstance(list_error, dict):
+                        code = list_error.get("code")
+                        msg = list_error.get("message") or list_error.get("error")
+                        if code not in (None, "") or msg:
+                            detail = f" (API code={code} message={msg})"
                     return {
                         "code": 1,
-                        "error": f"failed to list unlocked collections for group {group_id}",
+                        "error": f"failed to list unlocked collections for group {group_id}{detail}",
+                        "group_id": group_id,
+                        "display_name": display_name,
                     }
                 if len(item_ids) < qty:
                     return {
@@ -2764,6 +5304,8 @@ def main():
                 success_count = 0
                 fail_count = 0
                 for index, digital_collection_id in enumerate(item_ids[:qty], start=1):
+                    if index > 1 and CONSIGN_POST_INTERVAL_SEC > 0:
+                        time.sleep(CONSIGN_POST_INTERVAL_SEC)
                     payload = build_consign_create_payload(
                         digital_collection_id,
                         parsed.price,
@@ -2776,10 +5318,60 @@ def main():
                         f"digitalCollectionId={digital_collection_id}",
                         flush=True,
                     )
-                    result = client.post(consign_path, payload)
+                    result = client_post_with_rate_limit_retry(
+                        client,
+                        consign_path,
+                        payload,
+                        label=f"consign-create {index}/{qty}",
+                    )
                     ok = is_success(result)
+                    create_order_id = extract_consign_order_id_from_result(result) if ok else None
+                    consign_order_id = create_order_id
+                    seller_entry = None
+                    if ok:
+                        seller_entry = resolve_seller_consign_entry_after_create(
+                            client,
+                            group_id,
+                            digital_collection_id,
+                            parsed.price,
+                            create_order_id or "",
+                        )
+                        if seller_entry:
+                            consign_order_id = seller_entry.get("display_id") or seller_entry.get("consign_order_id")
+                    if ok and uid and (not seller_entry or not seller_entry.get("market_listing_id")):
+                        market_listing_id = resolve_market_listing_id_after_create(
+                            client,
+                            config,
+                            group_id,
+                            uid,
+                            create_order_id=create_order_id or "",
+                            digital_collection_id=digital_collection_id,
+                            price_yuan=parsed.price,
+                            retries=4,
+                            delay_sec=2.0,
+                        )
+                        if market_listing_id:
+                            consign_order_id = market_listing_id
+                    elif ok and not consign_order_id:
+                        consign_order_id = resolve_consign_order_id_after_create(
+                            client,
+                            group_id,
+                            digital_collection_id,
+                            parsed.price,
+                        )
                     if ok:
                         success_count += 1
+                        if consign_order_id:
+                            print(
+                                f"[consign-create] ok digitalCollectionId={digital_collection_id} "
+                                f"consignOrderId={consign_order_id}"
+                                + (
+                                    f" createOrderId={create_order_id}"
+                                    if create_order_id and create_order_id != consign_order_id
+                                    else ""
+                                ),
+                                flush=True,
+                            )
                     else:
                         fail_count += 1
                         print(
@@ -2790,15 +5382,46 @@ def main():
                     results.append(
                         {
                             "digitalCollectionId": digital_collection_id,
+                            "consign_order_id": consign_order_id,
+                            "create_order_id": create_order_id,
+                            "purchase_order_id": (
+                                (seller_entry or {}).get("purchase_id")
+                                or consign_order_id
+                            ),
                             "ok": ok,
                             "result": result,
                         }
                     )
+                    report_task_progress(index, qty)
 
                 summary = (
                     f"{display_name}藏品寄售已完成，寄售个数：{success_count}，失败个数：{fail_count}"
                 )
                 print(summary, flush=True)
+                consign_order_ids = []
+                consign_pairs = []
+                for entry in results:
+                    if not entry.get("ok"):
+                        continue
+                    create_id = str(entry.get("create_order_id") or entry.get("consign_order_id") or "")
+                    dc_id = str(entry.get("digitalCollectionId") or "")
+                    if create_id and dc_id:
+                        token = f"{create_id}|{dc_id}"
+                        consign_pairs.append(
+                            {
+                                "order_id": create_id,
+                                "digital_collection_id": dc_id,
+                                "display_token": token,
+                            }
+                        )
+                        consign_order_ids.append(token)
+                    elif create_id:
+                        consign_order_ids.append(create_id)
+                purchase_order_ids = [
+                    str(entry["purchase_order_id"])
+                    for entry in results
+                    if entry.get("ok") and entry.get("purchase_order_id")
+                ]
                 return {
                     "code": 0 if fail_count == 0 else 1,
                     "message": summary,
@@ -2806,7 +5429,12 @@ def main():
                     "collectionName": display_name,
                     "successCount": success_count,
                     "failCount": fail_count,
+                    "consignOrderIds": consign_order_ids,
+                    "consignPairs": consign_pairs,
+                    "purchaseOrderIds": purchase_order_ids,
                     "group_id": group_id,
+                    "seller_uid": str(uid or ""),
+                    "price_yuan": float(parsed.price),
                     "results": results,
                 }
 
@@ -2879,6 +5507,8 @@ def main():
                 success_count = 0
                 fail_count = 0
                 for index, entry in enumerate(consigned, start=1):
+                    if index > 1 and CONSIGN_POST_INTERVAL_SEC > 0:
+                        time.sleep(CONSIGN_POST_INTERVAL_SEC)
                     consign_order_id = entry["consign_order_id"]
                     cancel_path = render_command_path(
                         config,
@@ -2891,7 +5521,12 @@ def main():
                         f"consignOrderId={consign_order_id}",
                         flush=True,
                     )
-                    result = client.post(cancel_path, cancel_password_payload)
+                    result = client_post_with_rate_limit_retry(
+                        client,
+                        cancel_path,
+                        cancel_password_payload,
+                        label=f"consign-cancel {index}/{len(consigned)}",
+                    )
                     ok = is_success(result)
                     if ok:
                         success_count += 1
@@ -2903,6 +5538,7 @@ def main():
                             flush=True,
                         )
                     results.append({"consign_order_id": consign_order_id, "ok": ok, "result": result})
+                    report_task_progress(index, len(consigned))
 
                 summary = (
                     f"{display_name}藏品下架已完成，下架个数：{success_count}，失败个数：{fail_count}"
@@ -2941,30 +5577,43 @@ def main():
             collection_name = (parsed.collection_name or "").strip()
             group_id_override = (parsed.group_id or "").strip()
             if collection_name or group_id_override:
-                target_qty = parsed.quantity
+                target_qty = max(1, int(parsed.quantity))
                 target_min_price_yuan = parsed.min_price
                 target_min_price_fen = int(round(target_min_price_yuan * 100))
                 consignment_password = parsed.consignment_password or ""
                 collection_id_override = (parsed.collection_id or "").strip()
                 payment_platform = parsed.payment_platform
                 po_page_size = parsed.po_page_size
+                po_max_pages = max(1, int(parsed.po_max_pages or 5))
                 market_search_pages = max(1, int(parsed.market_search_pages or 1))
                 market_segment_id = str(parsed.market_segment_id or "-1")
+                poll_interval = parsed.poll_interval
+                if poll_interval is None:
+                    poll_interval = float(
+                        get_command_default(
+                            config,
+                            "wanted-deal",
+                            "poll_interval",
+                            str(WANTED_DEAL_DEFAULT_POLL_INTERVAL_SEC),
+                        )
+                    )
+                poll_interval = max(1.0, float(poll_interval))
+                extra_payload = parse_payload_arg(parsed.payload) or {}
                 dry_run = parsed.dry_run
 
                 def wanted_deal_by_name_operation():
-                    auth_token = getattr(client, "token", None) or ((saved_session or {}).get("token") if saved_session else None)
+                    auth_token = getattr(client, "token", None) or (
+                        (saved_session or {}).get("token") if saved_session else None
+                    )
                     webview_headers = build_webview_api_headers(
                         auth_token,
                         origin="https://detail-page.ibox.art",
                         app_version=app_version,
                     )
-                    warmed_groups = set()
-                    auth_failure_result = None
 
                     def group_from_market_item(item: dict, source: str) -> dict | None:
                         name = first_present(item, ("name", "groupName", "collectionName", "title"))
-                        if not name or (collection_name and collection_name not in str(name)):
+                        if not name or (collection_name and not collection_name_matches(collection_name, str(name))):
                             return None
                         gid = first_present(item, ("id", "groupId", "collectionGroupId", "digitalCollectionGroupId"))
                         if gid in (None, ""):
@@ -2973,7 +5622,13 @@ def main():
 
                     def find_market_groups() -> list[dict]:
                         if group_id_override:
-                            return [{"group_id": group_id_override, "name": collection_name or f"group-{group_id_override}", "source": "cli"}]
+                            return [
+                                {
+                                    "group_id": group_id_override,
+                                    "name": collection_name or f"group-{group_id_override}",
+                                    "source": "cli",
+                                }
+                            ]
                         seen = set()
                         groups = []
                         for page_no in range(1, market_search_pages + 1):
@@ -2982,9 +5637,17 @@ def main():
                                 f"?sortType=0&pageNo={page_no}&segmentId={market_segment_id}"
                                 "&sortField=2&pageSize=50&timeRange=0"
                             )
-                            result = client.get(path)
-                            if not is_success(result):
-                                print(f"[wanted-deal] market page {page_no} failed: code={result.get('code')}", flush=True)
+                            result, api_error = client_get_with_rate_limit_retry(
+                                client,
+                                path,
+                                label=f"wanted-deal market page={page_no}",
+                            )
+                            if result is None:
+                                print(
+                                    f"[wanted-deal] market page {page_no} failed: "
+                                    f"code={(api_error or {}).get('code')} message={(api_error or {}).get('message')}",
+                                    flush=True,
+                                )
                                 continue
                             page_items = extract_list_payload(result)
                             for item in page_items:
@@ -3000,165 +5663,361 @@ def main():
                                 break
                         return groups
 
-                    def warm_market_context(group_id: str) -> None:
-                        nonlocal auth_failure_result
-                        if group_id in warmed_groups:
-                            return
-                        warmed_groups.add(group_id)
-                        path = (
-                            f"/public-market-service/digital-collection-groups/{group_id}"
-                            "/purchase-consignment-info?configType=0"
-                        )
-                        result = client.get(path)
-                        if is_auth_failure(result):
-                            auth_failure_result = result
-                            return
-                        if not is_success(result):
-                            print(f"[wanted-deal] market context warmup failed for group {group_id}: code={result.get('code')}", flush=True)
-
-                    def list_purchase_orders(group_id: str) -> list[dict]:
-                        nonlocal auth_failure_result
-                        warm_market_context(group_id)
-                        if auth_failure_result:
-                            return []
-                        path = (
-                            f"/public-market-service/digital-collection-groups/{group_id}"
-                            f"/purchase-orders?pageNo=1&pageSize={po_page_size}&uid={_uid}"
-                        )
-                        result = client.get(path, headers=webview_headers)
-                        if is_auth_failure(result):
-                            auth_failure_result = result
-                            return []
-                        if not is_success(result):
-                            print(f"[wanted-deal] purchase-orders failed for group {group_id}: code={result.get('code')}", flush=True)
-                            return []
-                        return extract_list_payload(result)
-
-                    def candidate_from_order(group: dict, order: dict) -> dict | None:
-                        po_id = first_present(order, ("id", "purchaseOrderId", "purchaseConsignmentOrderId", "purchaseOrderNo", "advanceOrderId"))
-                        relation_id = first_present(order, ("orderRelationId", "relationId", "relation_id"))
-                        if po_id in (None, "") or relation_id in (None, ""):
-                            return None
-                        price_fen = to_price_fen(first_present(order, ("price", "unitPrice", "salePrice")))
-                        if target_min_price_fen > 0 and price_fen is not None and price_fen < target_min_price_fen:
-                            return None
-                        return {
-                            "group_id": group["group_id"],
-                            "group_name": group["name"],
-                            "purchase_order_id": str(po_id),
-                            "relation_id": str(relation_id),
-                            "price_fen": price_fen,
-                            "price_yuan": None if price_fen is None else price_fen / 100,
-                            "payment_platform": first_present(order, ("paymentPlatformCode", "paymentPlatform")) or payment_platform,
-                        }
-
-                    def pick_owned_collection_id(group_id: str) -> str | None:
-                        if collection_id_override:
-                            return collection_id_override
-                        path = (
-                            f"/personal-center-service/users/digital-collection-groups/{group_id}"
-                            "?pageSize=20&pageNo=1&lockStatus=0"
-                        )
-                        result = client.get(path)
-                        if not is_success(result):
-                            print(f"[wanted-deal] owned collections failed for group {group_id}: code={result.get('code')}", flush=True)
-                            return None
-                        for item in extract_list_payload(result):
-                            if not isinstance(item, dict):
-                                continue
-                            cid = first_present(item, ("id", "digitalCollectionId", "collectionId", "digitalCollectionID", "collectionID"))
-                            if cid not in (None, ""):
-                                return str(cid)
-                        return None
-
                     matched_groups = find_market_groups()
                     if not matched_groups:
-                        return {"code": 1, "error": f"No public market group found matching name: {collection_name!r}"}
-
-                    print(f"[wanted-deal] matched group(s): " + ", ".join(f"{g['name']}({g['group_id']})" for g in matched_groups), flush=True)
-
-                    candidates = []
-                    for group in matched_groups:
-                        orders = list_purchase_orders(group["group_id"])
-                        if auth_failure_result:
-                            return auth_failure_result
-                        print(f"[wanted-deal] {len(orders)} purchase order(s) in group {group['group_id']}", flush=True)
-                        for order in orders:
-                            if not isinstance(order, dict):
-                                continue
-                            candidate = candidate_from_order(group, order)
-                            if candidate:
-                                candidates.append(candidate)
-
-                    if not candidates:
                         return {
                             "code": 1,
-                            "error": f"No buy orders found for name={collection_name!r} with price >= {target_min_price_yuan}.",
-                            "matched_groups": matched_groups,
+                            "error": f"No public market group found matching name: {collection_name!r}",
                         }
 
-                    candidates.sort(key=lambda c: (c["price_fen"] or 0), reverse=True)
-                    print(f"[wanted-deal] {len(candidates)} candidate(s):", flush=True)
-                    for candidate in candidates[: min(len(candidates), 5)]:
-                        print(
-                            f"  purchase_order_id={candidate['purchase_order_id']} "
-                            f"relation_id={candidate['relation_id']} "
-                            f"price={format_price_yuan(candidate['price_fen'])}",
-                            flush=True,
-                        )
+                    print(
+                        "[wanted-deal] matched group(s): "
+                        + ", ".join(f"{g['name']}({g['group_id']})" for g in matched_groups),
+                        flush=True,
+                    )
+                    print(
+                        f"[wanted-deal] target quantity={target_qty} min_price>={target_min_price_yuan}yuan "
+                        f"poll_interval={poll_interval:g}s",
+                        flush=True,
+                    )
 
                     if dry_run:
-                        return {"code": 0, "dry_run": True, "matched_groups": matched_groups, "candidates": candidates}
+                        candidates: list[dict] = []
+                        for group in matched_groups:
+                            warmup_path = (
+                                f"/public-market-service/digital-collection-groups/{group['group_id']}"
+                                "/purchase-consignment-info?configType=0"
+                            )
+                            orders, list_error = list_group_wanted_purchase_orders(
+                                client,
+                                group["group_id"],
+                                _uid,
+                                page_size=po_page_size,
+                                max_pages=po_max_pages,
+                                webview_headers=webview_headers,
+                                warmup_path=warmup_path,
+                            )
+                            if list_error and is_auth_failure(list_error):
+                                return list_error
+                            for order in orders:
+                                candidate = wanted_deal_candidate_from_order(
+                                    group,
+                                    order,
+                                    min_price_fen=target_min_price_fen,
+                                    payment_platform=payment_platform,
+                                )
+                                if candidate:
+                                    candidates.append(candidate)
+                        candidates.sort(key=lambda c: (c["price_fen"] or 0), reverse=True)
+                        print(f"[wanted-deal] dry-run: {len(candidates)} candidate(s)", flush=True)
+                        for candidate in candidates[: min(len(candidates), 10)]:
+                            print(
+                                f"  purchase_order_id={candidate['purchase_order_id']} "
+                                f"relation_id={candidate['relation_id']} "
+                                f"price={format_price_yuan(candidate['price_fen'])}",
+                                flush=True,
+                            )
+                        return {
+                            "code": 0,
+                            "dry_run": True,
+                            "matched_groups": matched_groups,
+                            "candidates": candidates,
+                        }
 
                     if not consignment_password:
                         return {"code": 1, "error": "wanted-deal requires --consignment-password"}
 
-                    owned_collection_cache = {}
-                    deal_results = []
-                    last_code = 1
-                    for candidate in candidates[:target_qty]:
-                        group_id = candidate["group_id"]
-                        if group_id not in owned_collection_cache:
-                            owned_collection_cache[group_id] = pick_owned_collection_id(group_id)
-                        collection_id = owned_collection_cache[group_id]
-                        if not collection_id:
-                            return {"code": 1, "error": "Could not select an unlocked owned collection. Pass --collection-id explicitly."}
+                    remaining = target_qty
+                    used_collection_ids: set[str] = set()
+                    skip_deal_keys: set[str] = set()
+                    skip_purchase_order_ids: set[str] = set()
+                    collection_pools: dict[str, list[str]] = {}
+                    deal_results: list[dict] = []
+                    poll_attempt = 0
+                    wait_interval = poll_interval
+                    report_task_progress(0, target_qty)
 
-                        deal_path = render_command_path(
-                            config,
-                            "wanted-deal",
-                            "/order-create-service/advance-orders/{purchase_order_id}/relation/{relation_id}/deal?uid={uid}",
-                            purchase_order_id=candidate["purchase_order_id"],
-                            relation_id=candidate["relation_id"],
-                            uid=_uid,
-                        )
-                        deal_payload = {
-                            "paymentPlatformCode": int(candidate["payment_platform"]),
-                            "digitalCollectionId": int(collection_id),
-                            "consignmentPassword": consignment_password,
-                            "password": consignment_password,
-                            "consignPassword": consignment_password,
-                            "consignmentPassWord": consignment_password,
-                        }
+                    while remaining > 0:
+                        poll_attempt += 1
+                        candidates = []
+                        inventory_exhausted_round = False
+                        for group in matched_groups:
+                            gid = group["group_id"]
+                            pool_ready, pool_error = ensure_wanted_deal_collection_pool(
+                                client,
+                                gid,
+                                used_ids=used_collection_ids,
+                                min_available=remaining,
+                                pools=collection_pools,
+                                force_refresh=True,
+                            )
+                            if pool_error and is_auth_failure(pool_error):
+                                message = str(
+                                    pool_error.get("message")
+                                    or pool_error.get("error")
+                                    or "登录已失效"
+                                )
+                                return {
+                                    "code": 401,
+                                    "message": message,
+                                    "error": (
+                                        f"list-owned-items auth failed: {message}. "
+                                        "Saved session may have expired — pass SMS code to log in again."
+                                    ),
+                                    "deal_results": deal_results,
+                                    "remaining": remaining,
+                                    "matched_groups": matched_groups,
+                                }
+                            if not pool_ready:
+                                print(
+                                    f"[wanted-deal] no unlocked collections available in wallet "
+                                    f"(remaining={remaining}); stopping.",
+                                    flush=True,
+                                )
+                                inventory_exhausted_round = True
+                                break
+                            warmup_path = (
+                                f"/public-market-service/digital-collection-groups/{gid}"
+                                "/purchase-consignment-info?configType=0"
+                            )
+                            orders, list_error = list_group_wanted_purchase_orders(
+                                client,
+                                gid,
+                                _uid,
+                                page_size=po_page_size,
+                                max_pages=po_max_pages,
+                                webview_headers=webview_headers,
+                                warmup_path=warmup_path,
+                            )
+                            if list_error and is_auth_failure(list_error):
+                                return list_error
+                            print(
+                                f"[wanted-deal] scan group={gid} "
+                                f"purchase_orders={len(orders)} (attempt {poll_attempt})",
+                                flush=True,
+                            )
+                            for order in orders:
+                                candidate = wanted_deal_candidate_from_order(
+                                    group,
+                                    order,
+                                    min_price_fen=target_min_price_fen,
+                                    payment_platform=payment_platform,
+                                )
+                                if not candidate:
+                                    continue
+                                po_id = candidate["purchase_order_id"]
+                                if po_id in skip_purchase_order_ids:
+                                    continue
+                                deal_key = wanted_deal_relation_key(po_id, candidate["relation_id"])
+                                if deal_key in skip_deal_keys:
+                                    continue
+                                candidates.append(candidate)
+
+                        if inventory_exhausted_round:
+                            break
+
+                        candidates = dedupe_wanted_deal_candidates(candidates)
+                        if len(candidates) > WANTED_DEAL_MAX_CANDIDATES_PER_ROUND:
+                            print(
+                                f"[wanted-deal] trying top {WANTED_DEAL_MAX_CANDIDATES_PER_ROUND}/"
+                                f"{len(candidates)} unique purchase order(s) this round",
+                                flush=True,
+                            )
+                            candidates = candidates[:WANTED_DEAL_MAX_CANDIDATES_PER_ROUND]
+
+                        if not candidates:
+                            print(
+                                f"[wanted-deal] no buy orders with price>={target_min_price_yuan}yuan "
+                                f"(remaining={remaining}); retry in {wait_interval:g}s",
+                                flush=True,
+                            )
+                            time.sleep(wait_interval)
+                            continue
+
                         print(
-                            f"[wanted-deal] dealing purchase_order_id={candidate['purchase_order_id']} "
-                            f"relation_id={candidate['relation_id']} collection_id={collection_id}",
+                            f"[wanted-deal] {len(candidates)} unique purchase order(s) at or above min price; "
+                            f"remaining={remaining}",
                             flush=True,
                         )
-                        deal_result = client.post(deal_path, deal_payload)
-                        last_code = deal_result.get("code", 0 if is_success(deal_result) else 1)
-                        deal_results.append({
-                            "purchase_order_id": candidate["purchase_order_id"],
-                            "relation_id": candidate["relation_id"],
-                            "collection_id": collection_id,
-                            "payment_platform": candidate["payment_platform"],
-                            "group_name": candidate["group_name"],
-                            "price_fen": candidate["price_fen"],
-                            "price_yuan": candidate["price_yuan"],
-                            "deal": deal_result,
-                        })
+                        progress_this_round = False
+                        inventory_exhausted = False
 
-                    return {"code": last_code, "deal_results": deal_results, "matched_groups": matched_groups}
+                        for candidate in candidates:
+                            if remaining <= 0:
+                                break
+                            po_id = candidate["purchase_order_id"]
+                            if po_id in skip_purchase_order_ids:
+                                continue
+                            deal_key = wanted_deal_relation_key(po_id, candidate["relation_id"])
+                            if deal_key in skip_deal_keys:
+                                continue
+
+                            collection_id, pick_error = resolve_wanted_deal_collection_id(
+                                client,
+                                candidate["group_id"],
+                                override=collection_id_override,
+                                used_ids=used_collection_ids,
+                                pools=collection_pools,
+                                min_available=remaining,
+                            )
+                            if pick_error and is_auth_failure(pick_error):
+                                message = str(
+                                    pick_error.get("message")
+                                    or pick_error.get("error")
+                                    or "登录已失效"
+                                )
+                                return {
+                                    "code": 401,
+                                    "message": message,
+                                    "error": (
+                                        f"list-owned-items auth failed: {message}. "
+                                        "Saved session may have expired — pass SMS code to log in again."
+                                    ),
+                                    "deal_results": deal_results,
+                                    "remaining": remaining,
+                                    "matched_groups": matched_groups,
+                                }
+                            if not collection_id:
+                                print(
+                                    f"[wanted-deal] no unlocked collections left in wallet "
+                                    f"(remaining={remaining}); stopping.",
+                                    flush=True,
+                                )
+                                inventory_exhausted = True
+                                break
+
+                            deal_path = render_command_path(
+                                config,
+                                "wanted-deal",
+                                "/order-create-service/advance-orders/{purchase_order_id}/relation/{relation_id}/deal?uid={uid}",
+                                purchase_order_id=candidate["purchase_order_id"],
+                                relation_id=candidate["relation_id"],
+                                uid=_uid,
+                            )
+                            deal_payload = build_wanted_deal_payload(
+                                payment_platform=int(candidate["payment_platform"]),
+                                collection_id=collection_id,
+                                consignment_password=consignment_password,
+                                extra=extra_payload,
+                            )
+                            print(
+                                f"[wanted-deal] dealing purchase_order_id={candidate['purchase_order_id']} "
+                                f"relation_id={candidate['relation_id']} collection_id={collection_id} "
+                                f"price={format_price_yuan(candidate['price_fen'])}",
+                                flush=True,
+                            )
+                            deal_result = client_post_with_rate_limit_retry(
+                                client,
+                                deal_path,
+                                deal_payload,
+                                label="wanted-deal",
+                            )
+                            ok = is_success(deal_result)
+                            entry = {
+                                "purchase_order_id": candidate["purchase_order_id"],
+                                "relation_id": candidate["relation_id"],
+                                "collection_id": collection_id,
+                                "payment_platform": candidate["payment_platform"],
+                                "group_name": candidate["group_name"],
+                                "price_fen": candidate["price_fen"],
+                                "price_yuan": candidate["price_yuan"],
+                                "deal": deal_result,
+                                "ok": ok,
+                            }
+                            deal_results.append(entry)
+
+                            if ok:
+                                remaining -= 1
+                                progress_this_round = True
+                                mark_wanted_deal_collection_consumed(
+                                    candidate["group_id"],
+                                    collection_id,
+                                    used_ids=used_collection_ids,
+                                    pools=collection_pools,
+                                )
+                                skip_deal_keys.add(deal_key)
+                                wait_interval = poll_interval
+                                print(
+                                    f"[wanted-deal] deal ok; progress {target_qty - remaining}/{target_qty}",
+                                    flush=True,
+                                )
+                                report_task_progress(target_qty - remaining, target_qty)
+                                if remaining > 0 and WANTED_DEAL_POST_INTERVAL_SEC > 0:
+                                    time.sleep(WANTED_DEAL_POST_INTERVAL_SEC)
+                            else:
+                                err_code = deal_result.get("code")
+                                err_msg = deal_result.get("message")
+                                if is_wanted_deal_stale_order(deal_result):
+                                    skip_purchase_order_ids.add(str(candidate["purchase_order_id"]))
+                                    print(
+                                        f"[wanted-deal] skip purchase_order_id={candidate['purchase_order_id']} "
+                                        f"(stale: code={err_code} message={err_msg})",
+                                        flush=True,
+                                    )
+                                else:
+                                    skip_deal_keys.add(deal_key)
+                                    print(
+                                        f"[wanted-deal] deal failed purchase_order_id={candidate['purchase_order_id']}: "
+                                        f"code={err_code} message={err_msg}",
+                                        flush=True,
+                                    )
+                                if is_rate_limited(deal_result):
+                                    wait_interval = min(max(wait_interval * 1.5, poll_interval), 30.0)
+                                    print(
+                                        f"[wanted-deal] rate limited; next scan in {wait_interval:g}s",
+                                        flush=True,
+                                    )
+                                    break
+
+                        if remaining <= 0:
+                            break
+                        if inventory_exhausted:
+                            break
+                        if not progress_this_round:
+                            print(
+                                f"[wanted-deal] no successful deal this round (remaining={remaining}); "
+                                f"retry in {wait_interval:g}s",
+                                flush=True,
+                            )
+                            time.sleep(wait_interval)
+
+                    success_count = target_qty - remaining
+                    unsold_count = remaining
+                    attempt_fail_count = sum(1 for item in deal_results if not item.get("ok"))
+                    if success_count >= target_qty:
+                        outcome = "求购成交已完成"
+                    elif success_count > 0:
+                        outcome = (
+                            f"求购部分完成（目标 {target_qty}，已卖出 {success_count}，"
+                            f"未卖出 {unsold_count}）"
+                        )
+                    else:
+                        outcome = "求购成交未完成"
+                    summary = (
+                        f"{collection_name or matched_groups[0]['name']}{outcome}，"
+                        f"成交个数：{success_count}，未卖出个数：{unsold_count}"
+                    )
+                    if attempt_fail_count:
+                        print(
+                            f"[wanted-deal] stale/failed order attempts this run: {attempt_fail_count}",
+                            flush=True,
+                        )
+                    print(summary, flush=True)
+                    return {
+                        "code": 0 if success_count >= target_qty else 1,
+                        "message": summary,
+                        "summary": summary,
+                        "collectionName": collection_name or matched_groups[0]["name"],
+                        "successCount": success_count,
+                        "failCount": unsold_count,
+                        "unsoldCount": unsold_count,
+                        "attemptFailCount": attempt_fail_count,
+                        "targetQuantity": target_qty,
+                        "minPriceYuan": target_min_price_yuan,
+                        "remaining": remaining,
+                        "deal_results": deal_results,
+                        "matched_groups": matched_groups,
+                    }
 
                 operation = wanted_deal_by_name_operation
             else:
@@ -3168,13 +6027,15 @@ def main():
                         "Error: wanted-deal requires either --collection-name or both positional "
                         "arguments purchase_order_id and relation_id"
                     )
-                extra_payload = parse_payload_arg(parsed.payload)
+                extra_payload = parse_payload_arg(parsed.payload) or {}
                 deal_payload = {}
                 if parsed.consignment_password:
-                    deal_payload["consignmentPassword"] = parsed.consignment_password
-                    deal_payload["password"] = parsed.consignment_password
-                    deal_payload["consignPassword"] = parsed.consignment_password
-                    deal_payload["consignmentPassWord"] = parsed.consignment_password
+                    deal_payload.update(
+                        build_consign_password_fields(parsed.consignment_password)
+                    )
+                if (parsed.collection_id or "").strip():
+                    deal_payload["digitalCollectionId"] = int(parsed.collection_id)
+                deal_payload["paymentPlatformCode"] = int(parsed.payment_platform)
                 if extra_payload:
                     deal_payload.update(extra_payload)
                 path = render_command_path(
@@ -3185,60 +6046,300 @@ def main():
                     relation_id=parsed.relation_id,
                     uid=_uid,
                 )
-                operation = lambda: client.post(path, deal_payload)
-        elif cmd == "wanted-buy":
+                operation = lambda: client_post_with_rate_limit_retry(
+                    client,
+                    path,
+                    deal_payload,
+                    label="wanted-deal direct",
+                )
+        elif cmd == "sale-rush":
             collection_name = (parsed.collection_name or "").strip()
-            group_id = (parsed.group_id or "").strip()
-            price_yuan = parsed.price          # user passes yuan, e.g. 4.5
-            price_fen = int(round(price_yuan * 100))  # API uses 分 (cents)
-            quantity = parsed.quantity
-            payment_platform = parsed.payment_platform
+            sale_id_override = (parsed.sale_id or "").strip()
+            group_id_override = (parsed.group_id or "").strip()
+            quantity = int(parsed.quantity or 1)
+            payment_platform = (
+                parsed.payment_platform
+                if parsed.payment_platform is not None
+                else int(get_command_default(config, "sale-rush", "payment_platform_code", "30"))
+            )
             consignment_password = parsed.consignment_password or ""
             dry_run = parsed.dry_run
             extra_payload = parse_payload_arg(parsed.payload) or {}
+            wait_for_start = bool(parsed.wait_for_start)
+            retry_window = max(float(parsed.retry_window), 0.0)
+            retry_interval = max(float(parsed.retry_interval), 0.05)
 
-            # Resolve group_id from name if not provided
-            if not group_id and collection_name:
-                groups_result = client.get(
-                    "/personal-center-service/users/digital-collection-groups"
-                    "?groupType=0&isMetaVerse=0&pageNo=1&pageSize=100"
+            if not consignment_password and not dry_run:
+                raise SystemExit(
+                    "Error: sale-rush requires --支付密码 / --consignment-password (for wallet payment after order create)"
                 )
-                print(f"[wanted-buy] groups result: {json.dumps(groups_result, ensure_ascii=False)[:400]}", flush=True)
-                if not is_success(groups_result):
-                    raise SystemExit(f"Error: failed to fetch collection groups: {groups_result.get('code')}")
-                groups_data = (groups_result.get("data") or {})
-                groups_list = groups_data if isinstance(groups_data, list) else (
-                    groups_data.get("list") or groups_data.get("records") or groups_data.get("data") or []
-                )
-                matched = [g for g in groups_list if isinstance(g, dict) and collection_name in (g.get("name") or "")]
-                if not matched:
-                    raise SystemExit(f"Error: no collection group matching {collection_name!r}")
-                group_id = str(first_present(matched[0], ("id", "groupId")))
-                print(f"[wanted-buy] resolved group_id={group_id} name={matched[0].get('name')!r}")
-            elif not group_id:
-                raise SystemExit("Error: wanted-buy requires --group-id or --collection-name")
 
-            if dry_run:
-                def wanted_buy_op():
-                    return {"code": 0, "dry_run": True, "group_id": group_id, "price_fen": price_fen, "quantity": quantity}
-                operation = wanted_buy_op
-            else:
-                buy_payload = {
-                    "groupId": int(group_id),
-                    "price": price_fen,
-                    "quantity": quantity,
-                    "paymentPlatformCode": payment_platform,
+            def sale_rush_operation():
+                target = resolve_sale_rush_target(
+                    client,
+                    sale_id=sale_id_override,
+                    group_id=group_id_override,
+                    collection_name=collection_name,
+                    config=config,
+                )
+                if target.get("code") not in (None, 0):
+                    return target
+
+                sale_id = str(target.get("sale_id") or "")
+                if not sale_id:
+                    return {"code": 1, "error": "could not resolve sale_id from sale-info"}
+
+                name = str(target.get("collection_name") or collection_name or sale_id)
+                price_yuan = target.get("price_yuan")
+                max_buy = target.get("max_buy")
+                buy_num = quantity
+                if max_buy is not None and max_buy > 0:
+                    buy_num = min(buy_num, int(max_buy))
+
+                on_sale_time = target.get("on_sale_time")
+                if isinstance(on_sale_time, datetime):
+                    seconds_until = (on_sale_time - datetime.now()).total_seconds()
+                    if seconds_until > 0:
+                        print(
+                            f"[sale-rush] sale_id={sale_id} name={name!r} "
+                            f"opens at {on_sale_time.strftime('%Y-%m-%d %H:%M:%S')} "
+                            f"({seconds_until:.0f}s away) price={price_yuan}yuan num={buy_num}",
+                            flush=True,
+                        )
+                        if wait_for_start:
+                            _wait_until_start(on_sale_time)
+                        else:
+                            print("[sale-rush] --no-wait set, attempting order before official start…", flush=True)
+                    else:
+                        print(
+                            f"[sale-rush] sale_id={sale_id} name={name!r} "
+                            f"price={price_yuan}yuan num={buy_num}",
+                            flush=True,
+                        )
+                else:
+                    print(
+                        f"[sale-rush] sale_id={sale_id} name={name!r} "
+                        f"price={price_yuan}yuan num={buy_num}",
+                        flush=True,
+                    )
+
+                order_payload = build_sale_order_payload(
+                    buy_num,
+                    payment_platform,
+                    extra=extra_payload,
+                )
+
+                if dry_run:
+                    return {
+                        "code": 0,
+                        "dry_run": True,
+                        "sale_id": sale_id,
+                        "group_id": target.get("group_id"),
+                        "collection_name": name,
+                        "price_yuan": price_yuan,
+                        "quantity": buy_num,
+                        "payload": order_payload,
+                        "on_sale_time": on_sale_time.isoformat() if isinstance(on_sale_time, datetime) else None,
+                    }
+
+                warmup_sale_rush(client)
+
+                captcha_params, captcha_err = resolve_geetest_captcha_params(
+                    device_host=device_host,
+                    captcha_mode=parsed.captcha_mode,
+                    captcha_timeout=parsed.captcha_timeout,
+                    captcha_id=parsed.captcha_id,
+                    captcha_headed=getattr(parsed, "captcha_headed", False),
+                    context=f"sale_id={sale_id}",
+                    prefer_app=False,
+                )
+                if captcha_err:
+                    return {"code": 1, "error": captcha_err}
+
+                order_path = build_sale_order_path(config, sale_id, captcha_params or {})
+                report_task_progress(0, max(1, buy_num))
+
+                create_result: dict | None = None
+                started_at = time.monotonic()
+                attempt = 0
+                while time.monotonic() - started_at <= retry_window:
+                    attempt += 1
+                    create_result = client_post_with_rate_limit_retry(
+                        client,
+                        order_path,
+                        order_payload,
+                        label=f"sale-rush attempt={attempt}",
+                    )
+                    if is_success(create_result):
+                        break
+                    if is_auth_failure(create_result):
+                        return create_result
+                    code = create_result.get("code") if isinstance(create_result, dict) else None
+                    message = create_result.get("message") if isinstance(create_result, dict) else ""
+                    print(
+                        f"[sale-rush] create failed code={code} message={message!r}; "
+                        f"retry in {retry_interval:.2f}s…",
+                        flush=True,
+                    )
+                    if time.monotonic() - started_at + retry_interval > retry_window:
+                        break
+                    time.sleep(retry_interval)
+
+                if not isinstance(create_result, dict) or not is_success(create_result):
+                    return create_result or {"code": 1, "error": "sale-rush create order failed"}
+
+                ibox_token = getattr(client, "token", None) or (
+                    (saved_session or {}).get("token") if saved_session else None
+                )
+                total_yuan = (
+                    float(price_yuan) * buy_num
+                    if price_yuan is not None
+                    else None
+                )
+                payment = complete_purchase_payment(
+                    client,
+                    create_result=create_result,
+                    consignment_password=consignment_password,
+                    ibox_token=str(ibox_token or ""),
+                    app_version=app_version,
+                    max_price_yuan=total_yuan,
+                    config=config,
+                    payment_initiator_type=0,
+                    label="sale-rush",
+                )
+                paid = bool(payment.get("paid"))
+                if paid:
+                    report_task_progress(buy_num, buy_num)
+                return {
+                    "code": 0 if paid else 1,
+                    "message": "ok" if paid else (payment.get("error") or "wallet payment failed"),
+                    "paid": paid,
+                    "sale_id": sale_id,
+                    "group_id": target.get("group_id"),
+                    "collection_name": name,
+                    "price_yuan": price_yuan,
+                    "quantity": buy_num,
+                    "create": create_result,
+                    "payment": payment,
                 }
-                if consignment_password:
-                    buy_payload["consignmentPassword"] = consignment_password
-                    buy_payload["password"] = consignment_password
-                buy_payload.update(extra_payload)
+
+            operation = sale_rush_operation
+        elif cmd == "wanted-buy":
+            if not uid:
+                raise SystemExit(
+                    "Error: uid is required for wanted-buy. Pass --uid or ensure login response contains uid"
+                )
+            collection_name = (parsed.collection_name or "").strip()
+            group_id_override = (parsed.group_id or "").strip()
+            price_yuan = parsed.price
+            quantity = parsed.quantity
+            payment_platform = (
+                parsed.payment_platform
+                if parsed.payment_platform is not None
+                else int(get_command_default(config, "wanted-buy", "payment_platform_code", "30"))
+            )
+            consignment_password = parsed.consignment_password or ""
+            dry_run = parsed.dry_run
+            extra_payload = parse_payload_arg(parsed.payload) or {}
+            if not consignment_password and not dry_run:
+                raise SystemExit(
+                    "Error: wanted-buy requires --支付密码 / --consignment-password (for prepayment after order create)"
+                )
+
+            def resolve_wanted_buy_group_id() -> str | dict:
+                if group_id_override:
+                    return group_id_override
+                if not collection_name:
+                    return {
+                        "code": 1,
+                        "error": "wanted-buy requires --group-id or --collection-name",
+                    }
+                group_id = resolve_group_id_for_market(client, collection_name, config)
+                if isinstance(group_id, dict):
+                    return group_id
+                print(
+                    f"[wanted-buy] resolved group_id={group_id} name={collection_name!r}",
+                    flush=True,
+                )
+                return group_id
+
+            def wanted_buy_operation():
+                group_id = resolve_wanted_buy_group_id()
+                if isinstance(group_id, dict):
+                    return group_id
+
+                buy_payload = build_wanted_buy_payload(
+                    group_id,
+                    price_yuan,
+                    quantity,
+                    payment_platform,
+                    extra=extra_payload,
+                )
+
+                if dry_run:
+                    return {
+                        "code": 0,
+                        "dry_run": True,
+                        "group_id": group_id,
+                        "price_yuan": price_yuan,
+                        "buy_count": quantity,
+                        "payload": buy_payload,
+                    }
+
+                ibox_token = getattr(client, "token", None) or (
+                    (saved_session or {}).get("token") if saved_session else None
+                )
                 buy_path = render_command_path(
                     config,
                     "wanted-buy",
-                    "/order-create-service/advance-orders",
+                    "/order-create-service/advance-orders?uid={uid}",
+                    uid=uid,
                 )
-                operation = lambda: client.post(buy_path, buy_payload)
+                print(
+                    f"[wanted-buy] group_id={group_id} price={price_yuan}yuan "
+                    f"buyCount={quantity} paymentPlatformCode={payment_platform}",
+                    flush=True,
+                )
+                warmup_wanted_buy(client, group_id)
+                report_task_progress(0, max(1, int(quantity)))
+                create_result = client_post_with_rate_limit_retry(
+                    client,
+                    buy_path,
+                    buy_payload,
+                    label="wanted-buy",
+                )
+                if not is_success(create_result):
+                    return create_result
+
+                total_yuan = float(price_yuan) * max(1, int(quantity))
+                payment = complete_purchase_payment(
+                    client,
+                    create_result=create_result,
+                    consignment_password=consignment_password,
+                    ibox_token=str(ibox_token or ""),
+                    app_version=app_version,
+                    max_price_yuan=total_yuan,
+                    config=config,
+                    payment_initiator_type=1,
+                    label="wanted-buy",
+                )
+                paid = bool(payment.get("paid"))
+                if paid:
+                    report_task_progress(max(1, int(quantity)), max(1, int(quantity)))
+                return {
+                    "code": 0 if paid else 1,
+                    "message": "ok" if paid else (payment.get("error") or "prepayment failed"),
+                    "paid": paid,
+                    "group_id": group_id,
+                    "price_yuan": price_yuan,
+                    "buy_count": quantity,
+                    "purchase_order_id": payment.get("purchase_order_id"),
+                    "cashierLink": payment.get("cashierLink"),
+                    "create": create_result,
+                    "payment": payment,
+                }
+
+            operation = wanted_buy_operation
         elif cmd == "api":
             payload = parse_payload_arg(parsed.payload)
             operation = (
