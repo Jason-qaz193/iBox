@@ -1,0 +1,18 @@
+# frp server — run on Tencent Cloud CVM (bind 0.0.0.0).
+# Install: https://github.com/fatedier/frp/releases
+#   ./frps -c deploy/tencent-cvm/frps.toml
+#
+# 腾讯云安全组需放行：7000（frp 控制）、27042（RPC）、15555（adb）
+# 强烈建议改 token，并限制来源 IP；更推荐用 Tailscale 代替公网暴露端口。
+
+bindAddr = "0.0.0.0"
+bindPort = 7000
+
+auth.token = "CHANGE_ME_STRONG_TOKEN"
+
+# 可选：仅监听内网，配合 Tailscale 地址访问
+# bindAddr = "100.x.x.x"
+
+[log]
+to = "/var/log/frps.log"
+level = "info"

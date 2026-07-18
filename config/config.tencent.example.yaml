@@ -1,0 +1,34 @@
+# Copy to config/config.yaml on Tencent Cloud CVM.
+# Phone stays at home; CVM reaches it via Tailscale (recommended) or frp.
+
+base_url: "https://sail-api.ibox.art"
+
+# ── Tailscale（推荐）────────────────────────────────────────────────────────
+# CVM 与手机都安装 Tailscale，填手机的 Tailscale IP（100.x.x.x）
+device_host: "100.64.0.5"
+
+adb:
+  host: "100.64.0.5"
+  port: 5555
+
+# ── frp 备选（frps 跑在本 CVM，frpc 跑在家里能访问手机的设备上）────────────
+# device_host: "你的CVM公网IP"   # 或绑定的域名
+# adb:
+#   host: "你的CVM公网IP"
+#   port: 15555                  # frp 映射的 adb 端口
+
+login:
+  path: "/personal-center-service/login/mobile"
+  c_id: "your_c_id_here"
+
+sms:
+  path: "/personal-center-service/login/sendSms"
+
+headers:
+  app-version: "2.3.2"
+
+commands:
+  market-info:
+    path: "/public-market-service/digital-collection-groups/{group_id}/purchase-consignment-info?configType={config_type}"
+    defaults:
+      config_type: "0"

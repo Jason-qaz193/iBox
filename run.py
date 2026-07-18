@@ -67,6 +67,9 @@ def build_parser(config: dict | None = None) -> argparse.ArgumentParser:
     )
     parser.add_argument("--usb", action="store_true", help="Use USB + adb forward for RPC")
     parser.add_argument("--host", help="Phone IP for RPC WiFi mode")
+    parser.add_argument("--adb-host", help="Wireless adb host (cloud/Tailscale/frp)")
+    parser.add_argument("--adb-port", type=int, default=5555, help="Wireless adb port (default 5555)")
+    parser.add_argument("--adb-serial", help="adb device serial (skip adb connect)")
 
     subparsers = parser.add_subparsers(dest="command", required=True)
 
@@ -89,6 +92,12 @@ def build_parser(config: dict | None = None) -> argparse.ArgumentParser:
 
     capture_parser = subparsers.add_parser("capture", help="Print the last captured HTTP exchange")
     capture_parser.set_defaults()
+
+    bridge_check_parser = subparsers.add_parser(
+        "bridge-check",
+        help="Check RPC (27042) and wireless adb connectivity for cloud/hybrid deploy",
+    )
+    bridge_check_parser.set_defaults()
 
     login_parser = subparsers.add_parser("login", help="Login with SMS code")
     login_parser.add_argument("mobile")
@@ -159,7 +168,7 @@ def build_parser(config: dict | None = None) -> argparse.ArgumentParser:
 
     synthesis_auto = subparsers.add_parser(
         "synthesis-auto",
-        help="Scan all synthesis recipes and auto-submit every currently craftable one",
+        help="Scan synthesis recipes and auto-submit craftable ones (optionally filter by activity)",
     )
     add_auth_args(synthesis_auto)
     synthesis_auto.add_argument(
@@ -244,6 +253,18 @@ def build_parser(config: dict | None = None) -> argparse.ArgumentParser:
         type=float,
         default=60.0,
         help="Start polling this many seconds before the activity opens (default: 60)",
+    )
+    synthesis_auto.add_argument(
+        "--synthetic-id",
+        dest="synthetic_id_filter",
+        default="",
+        help="Only auto-submit this syntheticActivityId (e.g. 13993)",
+    )
+    synthesis_auto.add_argument(
+        "--activity-name",
+        dest="activity_name_filter",
+        default="",
+        help="Only auto-submit recipes whose activity/name matches this keyword",
     )
     synthesis_auto.add_argument(
         "--captcha-mode",
@@ -515,8 +536,19 @@ def build_parser(config: dict | None = None) -> argparse.ArgumentParser:
     add_auth_args(sale_rush)
     sale_rush.add_argument("--sale-id", dest="sale_id", default="", help="首发活动 ID（如 369）")
     sale_rush.add_argument("--group-id", dest="group_id", default="", help="藏品分组 ID")
-    sale_rush.add_argument("--collection-name", dest="collection_name", default="", help="藏品名称（自动查 group 与 sale-info）")
-    sale_rush.add_argument("--quantity", dest="quantity", type=positive_int, default=1, help="购买数量 num (default: 1)")
+    sale_rush.add_argument("--collection-name", dest="collection_name", default="", help="藏品名称（自动查 group 与 sale-info；省略时用 --auto）")
+    sale_rush.add_argument(
+        "--auto",
+        action="store_true",
+        help="自动匹配首页首发抢购活动（仅扫描 home/new-products 与 sale-infos 第 1 页，抢购所有 saleStatus=1）",
+    )
+    sale_rush.add_argument(
+        "--quantity",
+        dest="quantity",
+        type=sale_rush_quantity,
+        default=0,
+        help="购买数量；0 表示使用该活动允许的最大购买数 userOnceMaxBuyNum（默认 0）",
+    )
     sale_rush.add_argument(
         "--payment-platform",
         dest="payment_platform",
@@ -558,9 +590,9 @@ def build_parser(config: dict | None = None) -> argparse.ArgumentParser:
     sale_rush.add_argument(
         "--captcha-mode",
         choices=["app", "auto", "playwright", "manual", "skip"],
-        default="auto",
-        help="验证码：auto=Playwright 自动(语序点选/滑块)→失败再等 App；"
-        "playwright=仅浏览器；app/manual=仅 App 内完成(RPC 捕获)",
+        default="app",
+        help="验证码：首发抢购仅使用 App 内 WebView 原生验证码(RPC 捕获)；"
+        "auto/playwright 等同 app，不会弹出浏览器",
     )
     sale_rush.add_argument(
         "--captcha-timeout",
@@ -801,6 +833,24 @@ def positive_int(value: str) -> int:
     if parsed <= 0:
         raise argparse.ArgumentTypeError("must be a positive integer")
     return parsed
+
+
+def sale_rush_quantity(value: str) -> int:
+    parsed = int(value)
+    if parsed < 0:
+        raise argparse.ArgumentTypeError("must be >= 0")
+    return parsed
+
+
+def resolve_sale_rush_buy_quantity(requested: int, max_buy: int | None) -> int:
+    """0 requested means use activity max (userOnceMaxBuyNum)."""
+    if requested > 0:
+        if max_buy is not None and max_buy > 0:
+            return min(requested, int(max_buy))
+        return requested
+    if max_buy is not None and max_buy > 0:
+        return int(max_buy)
+    return 1
 
 
 _OWNED_COLLECTION_ID_KEYS = (
@@ -2503,6 +2553,231 @@ def resolve_sale_target_by_collection_name(
     return {"code": 1, "error": message, "similar": suggestions}
 
 
+def extract_sale_infos_list(result: dict | None) -> list[dict]:
+    if not is_success(result):
+        return []
+    data = (result or {}).get("data")
+    items: list = []
+    if isinstance(data, dict):
+        raw_list = data.get("list") or data.get("records") or []
+        items = raw_list if isinstance(raw_list, list) else []
+    else:
+        extracted = extract_list_payload(result)
+        items = extracted if isinstance(extracted, list) else []
+    return [item for item in items if isinstance(item, dict)]
+
+
+def fetch_home_new_products(client) -> dict | None:
+    return _unwrap_get_result(
+        client_get_with_rate_limit_retry(
+            client,
+            "/public-service/home/new-products",
+            label="sale-rush home/new-products",
+        )
+    )
+
+
+def is_home_first_publish_sale_item(item: dict) -> bool:
+    link = str(item.get("link") or "")
+    if "first-publish" in link:
+        return True
+    sale_id = first_present(item, ("id", "saleId", "saleInfoId"))
+    group_id = first_present(item, ("groupId", "digitalCollectionGroupId"))
+    if sale_id not in (None, "") and group_id not in (None, ""):
+        return True
+    group = item.get("digitalCollectionGroup")
+    if isinstance(group, dict) and group.get("id") not in (None, ""):
+        return bool(sale_id not in (None, ""))
+    return False
+
+
+def parse_home_sale_list_item(item: dict) -> dict | None:
+    if not is_home_first_publish_sale_item(item):
+        return None
+    sale_id = str(first_present(item, ("id", "saleId", "saleInfoId")) or "")
+    group_id = str(first_present(item, ("groupId", "digitalCollectionGroupId")) or "")
+    if not group_id:
+        group = item.get("digitalCollectionGroup")
+        if isinstance(group, dict):
+            group_id = str(group.get("id") or "")
+    if not sale_id:
+        return None
+    on_sale_time = parse_datetime_value(first_present(item, ("onSaleTime", "startTime")))
+    price = first_present(item, ("price", "salePrice"))
+    price_yuan = float(price) if price is not None else None
+    return {
+        "sale_id": sale_id,
+        "group_id": group_id,
+        "collection_name": sale_display_name_from_info(item),
+        "on_sale_time": on_sale_time,
+        "price_yuan": price_yuan,
+        "max_buy": to_int(first_present(item, ("userOnceMaxBuyNum", "maxBuyNum", "maxNum"))),
+        "sale_status": to_int(first_present(item, ("saleStatus", "status"))),
+        "link": str(item.get("link") or ""),
+    }
+
+
+def scan_home_sale_candidates(client) -> list[dict]:
+    """Scan homepage first-publish feeds only (no market / multi-page crawl)."""
+    seen: set[str] = set()
+    candidates: list[dict] = []
+
+    def add_items(items: list[dict], source: str) -> None:
+        for item in items:
+            parsed = parse_home_sale_list_item(item)
+            if not parsed:
+                continue
+            sale_id = str(parsed.get("sale_id") or "")
+            if not sale_id or sale_id in seen:
+                continue
+            seen.add(sale_id)
+            parsed["source"] = source
+            candidates.append(parsed)
+
+    new_products = fetch_home_new_products(client)
+    if isinstance(new_products, dict) and is_success(new_products):
+        add_items(extract_sale_infos_list(new_products), "home/new-products")
+
+    page1 = list_sale_infos_page(client, page_no=1, page_size=20)
+    if isinstance(page1, dict) and is_success(page1):
+        add_items(extract_sale_infos_list(page1), "sale-infos/page1")
+
+    return candidates
+
+
+def pick_auto_sale_rush_candidates(candidates: list[dict]) -> list[dict]:
+    """Return all on-sale (status=1) activities; if none, nearest upcoming (status=0)."""
+    if not candidates:
+        return []
+    now = datetime.now()
+    on_sale = [c for c in candidates if int(c.get("sale_status") or -1) == 1]
+    if on_sale:
+        return sorted(
+            on_sale,
+            key=lambda c: (
+                c.get("on_sale_time") or datetime.min,
+                int(c.get("sale_id") or 0),
+            ),
+            reverse=True,
+        )
+    upcoming = [
+        c
+        for c in candidates
+        if int(c.get("sale_status") or -1) == 0
+        and isinstance(c.get("on_sale_time"), datetime)
+        and c["on_sale_time"] > now
+    ]
+    if upcoming:
+        return [min(upcoming, key=lambda c: c["on_sale_time"])]
+    return []
+
+
+def enrich_sale_rush_picked_target(client, picked: dict) -> dict:
+    enriched = dict(picked)
+    info_result = fetch_sale_info_by_id(client, str(picked["sale_id"]))
+    if isinstance(info_result, dict) and is_success(info_result):
+        sale_data = extract_sale_info_record(info_result)
+        if sale_data:
+            enriched["collection_name"] = sale_display_name_from_info(
+                sale_data, enriched.get("collection_name") or ""
+            )
+            enriched["on_sale_time"] = parse_datetime_value(
+                first_present(sale_data, ("onSaleTime", "startTime"))
+            ) or enriched.get("on_sale_time")
+            price = first_present(sale_data, ("price", "salePrice"))
+            enriched["price_yuan"] = (
+                float(price) if price is not None else enriched.get("price_yuan")
+            )
+            enriched["max_buy"] = to_int(
+                first_present(sale_data, ("userOnceMaxBuyNum", "maxBuyNum", "maxNum"))
+            )
+            enriched["sale_status"] = to_int(
+                first_present(sale_data, ("saleStatus", "status"))
+            ) or enriched.get("sale_status")
+            sale_link = first_present(
+                sale_data,
+                ("link", "h5Link", "detailLink", "jumpUrl", "url", "pageUrl"),
+            )
+            if sale_link:
+                enriched["link"] = str(sale_link)
+            enriched["sale_info"] = info_result
+    return enriched
+
+
+def resolve_auto_sale_rush_targets(client) -> dict:
+    candidates = scan_home_sale_candidates(client)
+    if not candidates:
+        return {
+            "code": 1,
+            "error": "homepage has no first-publish sale activities (new-products / sale-infos page 1)",
+        }
+    picked_list = pick_auto_sale_rush_candidates(candidates)
+    if not picked_list:
+        preview = [
+            f"{c.get('collection_name')} status={c.get('sale_status')} sale_id={c.get('sale_id')}"
+            for c in candidates[:6]
+        ]
+        return {
+            "code": 1,
+            "error": "no eligible homepage sale (need status=抢购中/即将发售)",
+            "candidates": preview,
+        }
+
+    targets: list[dict] = []
+    for picked in picked_list:
+        enriched = enrich_sale_rush_picked_target(client, picked)
+        status = to_int(enriched.get("sale_status"))
+        if status is not None and status != 1:
+            print(
+                f"[sale-rush] skip sale_id={enriched.get('sale_id')} "
+                f"name={enriched.get('collection_name')!r} status={status} (not on-sale)",
+                flush=True,
+            )
+            continue
+        print(
+            f"[sale-rush] auto-picked sale_id={enriched['sale_id']} "
+            f"name={enriched.get('collection_name')!r} "
+            f"status={enriched.get('sale_status')} "
+            f"source={enriched.get('source')} "
+            f"opens={enriched['on_sale_time'].strftime('%Y-%m-%d %H:%M:%S') if isinstance(enriched.get('on_sale_time'), datetime) else '-'}",
+            flush=True,
+        )
+        targets.append(enriched)
+
+    if not targets:
+        return {
+            "code": 1,
+            "error": "no on-sale activities after sale-info refresh (need saleStatus=1)",
+        }
+
+    if len(targets) > 1:
+        print(
+            f"[sale-rush] auto mode: rushing {len(targets)} on-sale activities",
+            flush=True,
+        )
+    return {"code": 0, "targets": targets, "multi": len(targets) > 1}
+
+
+def is_captcha_related_failure(result: dict | None) -> bool:
+    if not isinstance(result, dict):
+        return False
+    code = result.get("code")
+    if code in (406, "406"):
+        return True
+    message = str(result.get("message") or result.get("error") or "").lower()
+    needles = (
+        "验证码",
+        "captcha",
+        "geetest",
+        "滑块",
+        "pass_token",
+        "lot_number",
+        "极验",
+        "风控",
+    )
+    return any(needle in message for needle in needles)
+
+
 def extract_sale_info_record(result: dict | None) -> dict | None:
     if not is_success(result):
         return None
@@ -2560,7 +2835,23 @@ def resolve_sale_rush_target(
     group_id: str,
     collection_name: str,
     config: dict,
+    auto: bool = False,
 ) -> dict:
+    if auto and not (sale_id or group_id or collection_name):
+        auto_resolved = resolve_auto_sale_rush_targets(client)
+        if auto_resolved.get("code") not in (None, 0):
+            return auto_resolved
+        targets = auto_resolved.get("targets") or []
+        if not targets:
+            return {"code": 1, "error": "no auto sale targets"}
+        if len(targets) == 1:
+            return {"code": 0, **targets[0]}
+        return {
+            "code": 0,
+            "targets": targets,
+            "multi": True,
+        }
+
     info_result: dict | None = None
     resolved_group_id = (group_id or "").strip()
     resolved_sale_id = (sale_id or "").strip()
@@ -2770,9 +3061,8 @@ def normalize_material_item(item: dict) -> dict | None:
             "inventoryCount",
             "numOwned",
             "countOwned",
-            "surplusNum",
-            "remainNum",
-            "leftNum",
+            # Do NOT use surplusNum/remainNum/leftNum here — those are often
+            # activity leftover quota, not wallet ownership (causes false craftable).
             "usableNum",
             "availableNum",
             "availableCount",
@@ -3167,6 +3457,138 @@ def extract_upcoming_synthetic_ids_with_start(
     return deduped, id_to_activity, earliest_start
 
 
+def _record_synthesis_name(names: set[str], value) -> None:
+    if value in (None, ""):
+        return
+    text = str(value).strip()
+    if text:
+        names.add(text)
+
+
+def build_synthetic_id_metadata(activity_details: list[dict]) -> dict[str, dict]:
+    """Map syntheticActivityId -> activity_id, display names, and schedule."""
+    metadata: dict[str, dict] = {}
+    for item in activity_details:
+        if not isinstance(item, dict):
+            continue
+        activity_id = str(item.get("activity_id", "") or "")
+        detail = item.get("detail")
+        if not is_success(detail):
+            continue
+        detail_data = (detail or {}).get("data") or {}
+        outer_names: set[str] = set()
+        _record_synthesis_name(outer_names, first_present(detail_data, ("name", "title", "activityName")))
+        _record_synthesis_name(outer_names, first_present(detail, ("name", "title", "activityName")))
+        for node in iter_nested_dicts(detail):
+            sid = first_present(node, ("syntheticActivityId", "synthetic_activity_id"))
+            if sid in (None, ""):
+                continue
+            sid = str(sid)
+            entry = metadata.setdefault(
+                sid,
+                {
+                    "activity_id": activity_id,
+                    "names": set(),
+                    "start_time": None,
+                    "end_time": None,
+                },
+            )
+            if activity_id:
+                entry["activity_id"] = activity_id
+            entry["names"].update(outer_names)
+            _record_synthesis_name(
+                entry["names"],
+                first_present(node, ("name", "title", "activityName", "description")),
+            )
+            for group in node.get("syntheticGroupNameList") or []:
+                if isinstance(group, dict):
+                    _record_synthesis_name(
+                        entry["names"],
+                        first_present(group, ("syntheticCustomDcName", "name", "title")),
+                    )
+            for album in node.get("targetAlbums") or []:
+                if isinstance(album, dict):
+                    _record_synthesis_name(
+                        entry["names"], first_present(album, ("name", "groupName", "title"))
+                    )
+            start_time = parse_datetime_value(first_present(node, ("startTime", "start_at", "beginTime")))
+            end_time = parse_datetime_value(first_present(node, ("endTime", "end_at", "finishTime")))
+            if start_time and (entry["start_time"] is None or start_time < entry["start_time"]):
+                entry["start_time"] = start_time
+            if end_time and (entry["end_time"] is None or end_time > entry["end_time"]):
+                entry["end_time"] = end_time
+    return metadata
+
+
+def synthesis_activity_name_matches(query: str, names: set[str]) -> bool:
+    for name in names:
+        if collection_name_matches(query, name):
+            return True
+    return False
+
+
+def apply_synthesis_activity_filter(
+    synthetic_ids: list[str],
+    upcoming_ids: set[str],
+    metadata: dict[str, dict],
+    *,
+    synthetic_id_filter: str | None,
+    activity_name_filter: str | None,
+) -> tuple[list[str], set[str], list[str]]:
+    if synthetic_id_filter:
+        sid = str(synthetic_id_filter).strip()
+        if not sid:
+            return synthetic_ids, upcoming_ids, []
+        universe = list(dict.fromkeys([*synthetic_ids, *upcoming_ids, *metadata.keys()]))
+        if sid not in universe:
+            return [], set(), []
+        filtered_ids = [sid]
+        filtered_upcoming = {sid} if sid in upcoming_ids else set()
+        return filtered_ids, filtered_upcoming, filtered_ids
+
+    if activity_name_filter:
+        query = str(activity_name_filter).strip()
+        if not query:
+            return synthetic_ids, upcoming_ids, list(synthetic_ids)
+        matched = [
+            sid
+            for sid, entry in metadata.items()
+            if synthesis_activity_name_matches(query, entry.get("names") or set())
+        ]
+        if not matched:
+            return [], set(), []
+        matched_set = set(matched)
+        filtered_from_scan = [sid for sid in synthetic_ids if sid in matched_set]
+        filtered_ids = filtered_from_scan or matched
+        filtered_upcoming = upcoming_ids & matched_set
+        if not filtered_upcoming and upcoming_ids:
+            filtered_upcoming = matched_set & set(upcoming_ids)
+        return filtered_ids, filtered_upcoming, matched
+
+    return synthetic_ids, upcoming_ids, list(synthetic_ids)
+
+
+def resolve_wait_target_for_synthetic_ids(
+    metadata: dict[str, dict],
+    synthetic_ids: list[str],
+    *,
+    pre_start_window: float,
+) -> datetime | None:
+    now = datetime.now()
+    earliest: datetime | None = None
+    for sid in synthetic_ids:
+        start_time = (metadata.get(str(sid)) or {}).get("start_time")
+        if start_time and start_time > now:
+            if earliest is None or start_time < earliest:
+                earliest = start_time
+    if earliest is None:
+        return None
+    seconds_until = (earliest - now).total_seconds()
+    if 0 < seconds_until <= pre_start_window:
+        return earliest
+    return None
+
+
 def _wait_until_start(target: datetime):
     """Sleep with periodic countdown prints until target datetime is reached.
 
@@ -3439,11 +3861,31 @@ def run_pre_start_wait_and_pre_center(
     wait_target: datetime,
     pre_center_offset: float,
     scan_concurrency: int,
-) -> dict[str, dict]:
+    remaining_target_count: int | None = None,
+    upcoming_ids: set[str] | None = None,
+    metadata: dict[str, dict] | None = None,
+) -> dict:
+    """Wait near open, match materials for this wave, then either arm for submit or skip.
+
+    Returns dict:
+      skip: bool — True when materials not enough (do not attempt this wave)
+      wave_ids: list[str]
+      craftable_ids: list[str]
+      centers: dict[str, dict] — pre-open centers (informational)
+      next_wait_target: datetime | None — suggested next activity when skipped
+    """
+    upcoming_ids = set(upcoming_ids or ())
+    metadata = metadata or {}
+    wave_ids = select_synthetic_ids_for_wait_wave(
+        synthetic_ids,
+        wait_target=wait_target,
+        upcoming_ids=upcoming_ids,
+        metadata=metadata,
+    )
     seconds_until = (wait_target - datetime.now()).total_seconds()
     print(
         f"[wait] Activity opens at {wait_target.strftime('%H:%M:%S')} "
-        f"({seconds_until:.0f}s away) — will pre-fetch synthesis-center "
+        f"({seconds_until:.0f}s away) — pre-match materials for wave {wave_ids} "
         f"{pre_center_offset:.0f}s before start…",
         flush=True,
     )
@@ -3451,31 +3893,78 @@ def run_pre_start_wait_and_pre_center(
     if pre_call_time > datetime.now():
         _wait_until_start(pre_call_time)
 
-    pre_center_cache = fetch_synthesis_centers_parallel(
+    pre_centers = fetch_synthesis_centers_parallel(
         client=client,
         config=config,
-        synthetic_ids=synthetic_ids,
+        synthetic_ids=wave_ids,
         concurrency=scan_concurrency,
     )
-    for synthetic_id in synthetic_ids:
-        center_result = pre_center_cache.get(str(synthetic_id), {})
+    for synthetic_id in wave_ids:
+        center_result = pre_centers.get(str(synthetic_id), {})
         if is_success(center_result):
             center_data = (center_result.get("data") or {})
             surplus_num = to_int(first_present(center_data, ("surplusNum", "remainNum", "leftNum")))
             print(
-                f"[pre-center] {synthetic_id} cached ✔"
+                f"[pre-match] {synthetic_id} center ✔"
                 + (f"  surplusNum={surplus_num}" if surplus_num is not None else ""),
                 flush=True,
             )
         else:
             print(
-                f"[pre-center] {synthetic_id} failed ({center_result.get('code')}), will fetch live",
+                f"[pre-match] {synthetic_id} center failed ({center_result.get('code')})",
                 flush=True,
             )
 
+    craftable_jobs, _ = plan_craftable_jobs_from_centers(
+        synthetic_ids=wave_ids,
+        center_results=pre_centers,
+        remaining_target_count=remaining_target_count,
+        log_prefix="[pre-match]",
+    )
+    craftable_ids = [str(job["synthetic_id"]) for job in craftable_jobs]
+    if not craftable_ids:
+        next_wait = next_synthesis_start_after(
+            metadata,
+            after=wait_target,
+            synthetic_ids=synthetic_ids,
+        )
+        print(
+            f"[pre-match] wave {wave_ids} materials NOT enough — skip this open"
+            + (
+                f", next activity at {next_wait.strftime('%H:%M:%S')}"
+                if next_wait
+                else ", continue monitoring"
+            ),
+            flush=True,
+        )
+        # Do not busy-wait until open; advance clock past this wave.
+        remain = (wait_target - datetime.now()).total_seconds()
+        if remain > 0:
+            time.sleep(min(remain + 0.5, 3.0))
+        return {
+            "skip": True,
+            "wave_ids": wave_ids,
+            "craftable_ids": [],
+            "centers": pre_centers,
+            "next_wait_target": next_wait,
+        }
+
+    print(
+        f"[pre-match] wave ready to craft: {craftable_ids} — waiting for open…",
+        flush=True,
+    )
     _wait_until_start(wait_target)
-    print("[wait] Activity start time reached, beginning synthesis attempts…", flush=True)
-    return pre_center_cache
+    print(
+        "[wait] Activity start time reached, submitting pre-matched recipes…",
+        flush=True,
+    )
+    return {
+        "skip": False,
+        "wave_ids": wave_ids,
+        "craftable_ids": craftable_ids,
+        "centers": pre_centers,
+        "next_wait_target": None,
+    }
 
 
 def synthesis_needs_slider(center_result: dict) -> bool:
@@ -3493,6 +3982,12 @@ def resolve_geetest_captcha_params(
     captcha_headed: bool,
     context: str,
     prefer_app: bool = False,
+    sale_rush: bool = False,
+    playwright_allowed: bool = True,
+    app_group_id: str = "",
+    app_sale_id: str = "",
+    app_sale_link: str = "",
+    app_collection_name: str = "",
 ) -> tuple[dict | None, str | None]:
     cap_mode = (captcha_mode or "auto").strip().lower()
     cap_timeout = captcha_timeout
@@ -3500,6 +3995,31 @@ def resolve_geetest_captcha_params(
 
     def capture_from_app(*, reuse_cached: bool = True) -> tuple[dict | None, str | None]:
         from src.frida_client import peek_rpc_captcha, poll_captcha
+
+        if sale_rush:
+            reuse_cached = False
+            print(f"[captcha] App 原生验证码 ({context})…", flush=True)
+            try:
+                from src.app_captcha_solver import solve_captcha_on_device
+
+                result = solve_captcha_on_device(
+                    device_host,
+                    timeout=cap_timeout,
+                    wake_app=True,
+                    group_id=app_group_id,
+                    sale_id=app_sale_id,
+                    sale_link=app_sale_link,
+                    collection_name=app_collection_name,
+                )
+                if result and result.get("lot_number"):
+                    print(
+                        f"[captcha] App token ✓  lot_number={result['lot_number'][:8]}…",
+                        flush=True,
+                    )
+                    return result, None
+            except Exception as exc:
+                print(f"[captcha] App captcha failed: {exc}", flush=True)
+            return None, f"App captcha not obtained within {cap_timeout:.0f} s"
 
         if reuse_cached:
             cached = peek_rpc_captcha(device_host=device_host)
@@ -3529,6 +4049,29 @@ def resolve_geetest_captcha_params(
             return params, None
         return None, f"Captcha not obtained within {cap_timeout:.0f} s"
 
+    def solve_with_http_sale_rush() -> tuple[dict | None, str | None]:
+        try:
+            from src.geetest_solver import sale_rush_solve
+
+            print(f"[captcha] HTTP/Playwright auto-solve ({context})…", flush=True)
+            result = sale_rush_solve(
+                captcha_id=cap_id,
+                timeout=cap_timeout,
+                headed=captcha_headed,
+                max_http_attempts=6,
+                max_playwright_retries=2 if playwright_allowed else 0,
+            )
+            if result and result.get("lot_number"):
+                print(
+                    f"[captcha] Sale-rush solved ✓  lot_number={result['lot_number'][:8]}…",
+                    flush=True,
+                )
+                return result, None
+            return None, "Sale-rush captcha solve returned empty result"
+        except Exception as exc:
+            print(f"[captcha] Sale-rush auto-solve failed: {exc}", flush=True)
+            return None, str(exc)
+
     def solve_with_playwright(*, headed: bool) -> tuple[dict | None, str | None]:
         try:
             from src.geetest_solver import playwright_solve, check_dependencies
@@ -3544,6 +4087,9 @@ def resolve_geetest_captcha_params(
                 captcha_id=cap_id,
                 timeout=cap_timeout,
                 headed=headed,
+                max_slider_attempts=10,
+                max_retries=2,
+                sale_rush=sale_rush,
             )
             if result and result.get("lot_number"):
                 print(
@@ -3556,13 +4102,44 @@ def resolve_geetest_captcha_params(
             print(f"[captcha] Playwright failed: {exc}", flush=True)
             return None, str(exc)
 
-    if cap_mode in {"app", "manual"}:
-        return capture_from_app(reuse_cached=True)
+    def solve_on_device(*, wake_app: bool = True) -> tuple[dict | None, str | None]:
+        try:
+            from src.app_captcha_solver import solve_captcha_on_device
+
+            print(f"[captcha] App WebView auto-solve ({context})…", flush=True)
+            result = solve_captcha_on_device(
+                device_host,
+                timeout=min(cap_timeout, 120.0),
+                wake_app=wake_app,
+            )
+            if result and result.get("lot_number"):
+                print(
+                    f"[captcha] App token ✓  lot_number={result['lot_number'][:8]}…",
+                    flush=True,
+                )
+                return result, None
+            return None, "App captcha not obtained"
+        except Exception as exc:
+            print(f"[captcha] App auto-solve failed: {exc}", flush=True)
+            return None, str(exc)
 
     if cap_mode == "skip":
         return None, f"Captcha required for {context} but --captcha-mode=skip"
 
+    if sale_rush:
+        if cap_mode in {"auto", "playwright"}:
+            print(
+                "[captcha] sale-rush 仅使用 App 原生验证码（已忽略 HTTP/Playwright 浏览器模式）",
+                flush=True,
+            )
+        return capture_from_app(reuse_cached=False)
+
+    if cap_mode in {"app", "manual"}:
+        return capture_from_app(reuse_cached=True)
+
     if cap_mode == "playwright":
+        if not playwright_allowed:
+            return capture_from_app(reuse_cached=False)
         result, err = solve_with_playwright(headed=captcha_headed)
         if result:
             return result, None
@@ -3574,10 +4151,14 @@ def resolve_geetest_captcha_params(
         if result:
             return result, None
         # Headed browser is less likely to get click-captcha than headless.
-        result, pw_err = solve_with_playwright(headed=True)
-        if result:
-            return result, None
+        if playwright_allowed:
+            result, pw_err = solve_with_playwright(headed=True)
+            if result:
+                return result, None
         print("[captcha] Playwright unavailable/failed, waiting for App captcha…", flush=True)
+        return capture_from_app(reuse_cached=False)
+
+    if not playwright_allowed:
         return capture_from_app(reuse_cached=False)
 
     result, err = solve_with_playwright(headed=captcha_headed)
@@ -3702,6 +4283,111 @@ def plan_synthesis_job(
         "material_state_signature": build_material_state_signature(candidate),
         "center_result": center_result,
     }
+
+
+def format_recipe_materials_brief(candidate: dict | None) -> str:
+    if not candidate:
+        return "-"
+    parts = []
+    for item in candidate.get("materials") or []:
+        parts.append(
+            f"{item.get('material_id')}:own={item.get('owned_count')}/need={item.get('required_count')}"
+        )
+    return ", ".join(parts) if parts else "-"
+
+
+def plan_craftable_jobs_from_centers(
+    *,
+    synthetic_ids: list[str],
+    center_results: dict[str, dict],
+    remaining_target_count: int | None,
+    log_prefix: str = "",
+) -> tuple[list[dict], list[dict]]:
+    """Return (craftable_jobs, cycle_entries). Logs non-craftable recipes when prefix set."""
+    craftable_jobs: list[dict] = []
+    cycle_entries: list[dict] = []
+    prefix = f"{log_prefix} " if log_prefix else ""
+    for synthetic_id in synthetic_ids:
+        center_result = center_results.get(str(synthetic_id), {})
+        entry: dict = {"synthetic_id": synthetic_id, "center": center_result}
+        job = plan_synthesis_job(center_result, synthetic_id, remaining_target_count)
+        if job is None:
+            if is_success(center_result):
+                entry["code"] = 0
+                entry["message"] = "Current materials are insufficient for this recipe."
+                mats = "-"
+                try:
+                    candidates = extract_recipe_candidates(center_result)
+                    if candidates:
+                        cand = choose_recipe_candidate(candidates, str(synthetic_id))
+                        mats = format_recipe_materials_brief(cand)
+                except SystemExit:
+                    mats = "ambiguous"
+                print(
+                    f"{prefix}synthetic_id={synthetic_id} materials NOT enough [{mats}]",
+                    flush=True,
+                )
+            else:
+                entry["code"] = center_result.get("code", 1)
+                print(
+                    f"{prefix}synthetic_id={synthetic_id} center failed "
+                    f"code={center_result.get('code')} "
+                    f"message={center_result.get('message') or center_result.get('error')}",
+                    flush=True,
+                )
+            cycle_entries.append(entry)
+            continue
+        job["center_result"] = center_result
+        craftable_jobs.append(job)
+        entry["plan"] = summarize_synthesis_plan(job["candidate"], job["max_times"])
+        entry["code"] = 0
+        cycle_entries.append(entry)
+        print(
+            f"{prefix}synthetic_id={synthetic_id} materials OK "
+            f"max_times={job['max_times']} "
+            f"[{format_recipe_materials_brief(job['candidate'])}]",
+            flush=True,
+        )
+    return craftable_jobs, cycle_entries
+
+
+def select_synthetic_ids_for_wait_wave(
+    synthetic_ids: list[str],
+    *,
+    wait_target: datetime,
+    upcoming_ids: set[str],
+    metadata: dict[str, dict] | None = None,
+) -> list[str]:
+    """Pick recipe ids that belong to the upcoming open wave at wait_target."""
+    metadata = metadata or {}
+    wave: list[str] = []
+    for sid in synthetic_ids:
+        sid = str(sid)
+        start_time = (metadata.get(sid) or {}).get("start_time")
+        if start_time and abs((start_time - wait_target).total_seconds()) <= 2.0:
+            wave.append(sid)
+            continue
+        if sid in upcoming_ids:
+            wave.append(sid)
+    return list(dict.fromkeys(wave)) or list(dict.fromkeys(str(s) for s in synthetic_ids))
+
+
+def next_synthesis_start_after(
+    metadata: dict[str, dict],
+    *,
+    after: datetime,
+    synthetic_ids: list[str] | None = None,
+) -> datetime | None:
+    allowed = {str(s) for s in synthetic_ids} if synthetic_ids is not None else None
+    earliest: datetime | None = None
+    for sid, entry in (metadata or {}).items():
+        if allowed is not None and str(sid) not in allowed:
+            continue
+        start_time = entry.get("start_time") if isinstance(entry, dict) else None
+        if start_time and start_time > after:
+            if earliest is None or start_time < earliest:
+                earliest = start_time
+    return earliest
 
 
 def prioritize_synthesis_jobs(
@@ -4135,6 +4821,11 @@ def main():
     parsed = parser.parse_args()
     use_rpc = resolve_mode(parsed)
     device_host = resolve_device_host(parsed, config)
+    from src.device_bridge import ensure_adb_ready, bridge_check as run_bridge_check
+
+    adb_serial = ensure_adb_ready(parsed, config)
+    if adb_serial:
+        print(f"[bridge] adb ready serial={adb_serial}", flush=True)
     base_url = config["base_url"]
     login_path = config["login"]["path"]
     sms_path = config.get("sms", {}).get("path", "/personal-center-service/login/sendSms")
@@ -4144,6 +4835,18 @@ def main():
     cmd = parsed.command
 
     # ── capture command ───────────────────────────────────────────────────────
+    if cmd == "bridge-check":
+        adb_cfg = config.get("adb") or {}
+        adb_host = getattr(parsed, "adb_host", None) or (
+            str(adb_cfg.get("host") or "").strip() if isinstance(adb_cfg, dict) else ""
+        ) or None
+        adb_port = int(getattr(parsed, "adb_port", None) or (
+            adb_cfg.get("port") if isinstance(adb_cfg, dict) else None
+        ) or 5555)
+        report = run_bridge_check(device_host, adb_host, adb_port)
+        print(json.dumps(report, ensure_ascii=False, indent=2))
+        raise SystemExit(0 if report.get("ready") else 1)
+
     if cmd == "capture":
         if not use_rpc:
             raise SystemExit("Error: capture requires RPC mode")
@@ -4500,6 +5203,88 @@ def main():
                             filtered = {sid for sid in pre_ids if sid not in active_set}
                             upcoming_ids = filtered or set(pre_ids)
 
+                    synthesis_metadata = build_synthetic_id_metadata(activity_details)
+                    sid_filter = (getattr(parsed, "synthetic_id_filter", "") or "").strip() or None
+                    name_filter = (getattr(parsed, "activity_name_filter", "") or "").strip() or None
+                    matched_filter_ids: list[str] = []
+                    if sid_filter or name_filter:
+                        synthetic_ids, upcoming_ids, matched_filter_ids = apply_synthesis_activity_filter(
+                            synthetic_ids,
+                            upcoming_ids,
+                            synthesis_metadata,
+                            synthetic_id_filter=sid_filter,
+                            activity_name_filter=name_filter,
+                        )
+                        # Name/id filter matched the whole activity family. Keep ALL
+                        # matched recipe ids for center checks — do not shrink to only
+                        # the not-yet-open "upcoming" subset (that caused 17:05 to
+                        # check only one id while materials were on another recipe).
+                        if matched_filter_ids:
+                            synthetic_ids = list(dict.fromkeys(matched_filter_ids))
+                            last_synthetic_ids = synthetic_ids
+                            upcoming_ids = {
+                                sid
+                                for sid in matched_filter_ids
+                                if (synthesis_metadata.get(str(sid)) or {}).get("start_time")
+                                and (synthesis_metadata.get(str(sid)) or {})["start_time"]
+                                > datetime.now()
+                            }
+                        filter_label = sid_filter or name_filter
+                        print(
+                            f"[synthesis-auto] activity filter {filter_label!r} -> "
+                            f"synthetic id(s) {synthetic_ids}"
+                            + (f" upcoming={sorted(upcoming_ids)}" if upcoming_ids else ""),
+                            flush=True,
+                        )
+                        filtered_wait = resolve_wait_target_for_synthetic_ids(
+                            synthesis_metadata,
+                            synthetic_ids,
+                            pre_start_window=parsed.pre_start_window,
+                        )
+                        if filtered_wait is not None:
+                            wait_target = filtered_wait
+                        elif matched_filter_ids:
+                            future_starts = [
+                                entry.get("start_time")
+                                for sid in matched_filter_ids
+                                for entry in [synthesis_metadata.get(str(sid)) or {}]
+                                if entry.get("start_time") and entry["start_time"] > datetime.now()
+                            ]
+                            if future_starts:
+                                wait_target = min(future_starts)
+                        # If some matched recipes are already open, do not sleep until the
+                        # next future start — try the active ones in this cycle first.
+                        active_matched = [sid for sid in synthetic_ids if sid not in upcoming_ids]
+                        if active_matched and wait_target is not None:
+                            print(
+                                f"[synthesis-auto] {len(active_matched)} matched id(s) already open "
+                                f"{active_matched}; skip wait until {wait_target.strftime('%H:%M:%S')}",
+                                flush=True,
+                            )
+                            wait_target = None
+
+                    if sid_filter or name_filter:
+                        if not synthetic_ids and not matched_filter_ids:
+                            retry_in = compute_synthesis_poll_interval(
+                                wait_target=wait_target,
+                                has_craftable=False,
+                                pre_start_window=parsed.pre_start_window,
+                                active_interval=parsed.loop_interval,
+                                idle_interval=idle_interval,
+                                far_interval=far_interval,
+                            )
+                            filter_label = sid_filter or name_filter
+                            print(
+                                f"[cycle {cycle_no}] No synthetic id matches filter {filter_label!r}, "
+                                f"retry in {retry_in:.1f}s…",
+                                flush=True,
+                            )
+                            time.sleep(retry_in)
+                            continue
+                        if not synthetic_ids and matched_filter_ids:
+                            synthetic_ids = matched_filter_ids
+                            last_synthetic_ids = synthetic_ids
+
                     if not synthetic_ids:
                         retry_in = compute_synthesis_poll_interval(
                             wait_target=wait_target,
@@ -4517,15 +5302,54 @@ def main():
                         continue
 
                     pre_center_cache: dict[str, dict] = {}
+                    waited_for_open = False
+                    pre_matched_ids: list[str] | None = None
                     if wait_target is not None and wait_target > datetime.now():
-                        pre_center_cache = run_pre_start_wait_and_pre_center(
+                        pre_match = run_pre_start_wait_and_pre_center(
                             client=client,
                             config=config,
                             synthetic_ids=synthetic_ids,
                             wait_target=wait_target,
                             pre_center_offset=parsed.pre_center_offset,
                             scan_concurrency=parsed.scan_concurrency,
+                            remaining_target_count=remaining_target_count,
+                            upcoming_ids=upcoming_ids,
+                            metadata=synthesis_metadata,
                         )
+                        if pre_match.get("skip"):
+                            next_wait = pre_match.get("next_wait_target")
+                            retry_in = compute_synthesis_poll_interval(
+                                wait_target=next_wait if isinstance(next_wait, datetime) else None,
+                                has_craftable=False,
+                                pre_start_window=parsed.pre_start_window,
+                                active_interval=parsed.loop_interval,
+                                idle_interval=idle_interval,
+                                far_interval=far_interval,
+                            )
+                            print(
+                                f"[cycle {cycle_no}] skip this wave (no materials); "
+                                f"retry in {retry_in:.1f}s…",
+                                flush=True,
+                            )
+                            if not continuous:
+                                break
+                            time.sleep(retry_in)
+                            cycles.append(
+                                {
+                                    "cycle": cycle_no,
+                                    "entries": [],
+                                    "skipped_wave": pre_match.get("wave_ids"),
+                                    "reason": "pre_match_no_materials",
+                                }
+                            )
+                            continue
+                        waited_for_open = True
+                        pre_matched_ids = list(pre_match.get("craftable_ids") or [])
+                        # Prefer live centers after open for submit accuracy.
+                        pre_center_cache = {}
+                        if pre_matched_ids:
+                            synthetic_ids = list(dict.fromkeys(pre_matched_ids))
+                            last_synthetic_ids = synthetic_ids
 
                     center_results = fetch_synthesis_centers_parallel(
                         client=client,
@@ -4534,30 +5358,19 @@ def main():
                         concurrency=parsed.scan_concurrency,
                         pre_center_cache=pre_center_cache,
                     )
-
-                    craftable_jobs: list[dict] = []
-                    cycle_entries: list[dict] = []
-                    for synthetic_id in synthetic_ids:
-                        center_result = center_results.get(str(synthetic_id), {})
-                        entry = {"synthetic_id": synthetic_id, "center": center_result}
-                        job = plan_synthesis_job(
-                            center_result,
-                            synthetic_id,
-                            remaining_target_count,
+                    if waited_for_open:
+                        print(
+                            f"[cycle {cycle_no}] live synthesis-center refresh after open "
+                            f"for {len(synthetic_ids)} pre-matched id(s)",
+                            flush=True,
                         )
-                        if job is None:
-                            if is_success(center_result):
-                                entry["code"] = 0
-                                entry["message"] = "Current materials are insufficient for this recipe."
-                            else:
-                                entry["code"] = center_result.get("code", 1)
-                            cycle_entries.append(entry)
-                            continue
-                        job["center_result"] = center_result
-                        craftable_jobs.append(job)
-                        entry["plan"] = summarize_synthesis_plan(job["candidate"], job["max_times"])
-                        entry["code"] = 0
-                        cycle_entries.append(entry)
+
+                    craftable_jobs, cycle_entries = plan_craftable_jobs_from_centers(
+                        synthetic_ids=synthetic_ids,
+                        center_results=center_results,
+                        remaining_target_count=remaining_target_count,
+                        log_prefix=f"[cycle {cycle_no}]",
+                    )
 
                     craftable_jobs = prioritize_synthesis_jobs(
                         craftable_jobs,
@@ -4570,18 +5383,32 @@ def main():
                             if not finish_batch("no_materials"):
                                 break
                         last_had_craftable = False
+                        next_wait = next_synthesis_start_after(
+                            synthesis_metadata,
+                            after=datetime.now(),
+                            synthetic_ids=last_synthetic_ids or synthetic_ids,
+                        )
                         retry_in = compute_synthesis_poll_interval(
-                            wait_target=wait_target,
+                            wait_target=next_wait,
                             has_craftable=False,
                             pre_start_window=parsed.pre_start_window,
                             active_interval=parsed.loop_interval,
                             idle_interval=idle_interval,
                             far_interval=far_interval,
                         )
-                        print(
-                            f"[cycle {cycle_no}] No craftable recipes in wallet, retry in {retry_in:.1f}s…",
-                            flush=True,
-                        )
+                        if next_wait:
+                            print(
+                                f"[cycle {cycle_no}] No craftable recipes — "
+                                f"wait next activity at {next_wait.strftime('%H:%M:%S')} "
+                                f"(retry in {retry_in:.1f}s)…",
+                                flush=True,
+                            )
+                        else:
+                            print(
+                                f"[cycle {cycle_no}] No craftable recipes in wallet, "
+                                f"retry in {retry_in:.1f}s…",
+                                flush=True,
+                            )
                         if not continuous:
                             break
                         time.sleep(retry_in)
@@ -4636,6 +5463,15 @@ def main():
                         submit_result = submit_outcome["result"]
                         confirmed = False
                         confirm_result = None
+                        if not is_success(submit_result):
+                            print(
+                                f"[cycle {cycle_no}] submit failed synthetic_id={synthetic_id} "
+                                f"code={submit_result.get('code') if isinstance(submit_result, dict) else submit_result} "
+                                f"message="
+                                f"{(submit_result or {}).get('message') if isinstance(submit_result, dict) else ''}"
+                                f" attempts={submit_outcome.get('attempt_count')}",
+                                flush=True,
+                            )
                         if is_success(submit_result):
                             need_slider = synthesis_needs_slider(center_result)
                             outer_activity_id = resolve_outer_activity_id(
@@ -4665,6 +5501,14 @@ def main():
                                     )
                                     confirm_result = client.confirm_synthesis(confirm_path, confirm_body)
                                     confirmed = is_success(confirm_result)
+                                    if not confirmed:
+                                        print(
+                                            f"[cycle {cycle_no}] confirm failed synthetic_id={synthetic_id} "
+                                            f"code={confirm_result.get('code') if isinstance(confirm_result, dict) else confirm_result} "
+                                            f"message="
+                                            f"{(confirm_result or {}).get('message') if isinstance(confirm_result, dict) else ''}",
+                                            flush=True,
+                                        )
                             else:
                                 confirm_path = build_synthesis_confirm_path(config, uid or "")
                                 confirm_body = build_synthesis_confirm_body(
@@ -4679,6 +5523,14 @@ def main():
                                 )
                                 confirm_result = client.confirm_synthesis(confirm_path, confirm_body)
                                 confirmed = is_success(confirm_result)
+                                if not confirmed:
+                                    print(
+                                        f"[cycle {cycle_no}] confirm failed synthetic_id={synthetic_id} "
+                                        f"code={confirm_result.get('code') if isinstance(confirm_result, dict) else confirm_result} "
+                                        f"message="
+                                        f"{(confirm_result or {}).get('message') if isinstance(confirm_result, dict) else ''}",
+                                        flush=True,
+                                    )
 
                         if confirmed:
                             cycle_progress = True
@@ -4749,6 +5601,8 @@ def main():
                     "activity_list": last_activity_list_result,
                     "activity_details": last_activity_details,
                     "synthetic_ids": last_synthetic_ids,
+                    "synthetic_id_filter": (getattr(parsed, "synthetic_id_filter", "") or "").strip() or None,
+                    "activity_name_filter": (getattr(parsed, "activity_name_filter", "") or "").strip() or None,
                     "cycles": cycles,
                     "target_count": parsed.target_count,
                     "remaining_target_count": remaining_target_count,
@@ -6056,7 +6910,7 @@ def main():
             collection_name = (parsed.collection_name or "").strip()
             sale_id_override = (parsed.sale_id or "").strip()
             group_id_override = (parsed.group_id or "").strip()
-            quantity = int(parsed.quantity or 1)
+            quantity = int(parsed.quantity or 0)
             payment_platform = (
                 parsed.payment_platform
                 if parsed.payment_platform is not None
@@ -6075,153 +6929,322 @@ def main():
                 )
 
             def sale_rush_operation():
-                target = resolve_sale_rush_target(
+                auto_pick = bool(getattr(parsed, "auto", False)) or (
+                    not collection_name and not sale_id_override and not group_id_override
+                )
+                resolved = resolve_sale_rush_target(
                     client,
                     sale_id=sale_id_override,
                     group_id=group_id_override,
                     collection_name=collection_name,
                     config=config,
+                    auto=auto_pick,
                 )
-                if target.get("code") not in (None, 0):
-                    return target
+                if resolved.get("code") not in (None, 0):
+                    return resolved
 
-                sale_id = str(target.get("sale_id") or "")
-                if not sale_id:
+                if resolved.get("multi") and isinstance(resolved.get("targets"), list):
+                    targets = resolved["targets"]
+                else:
+                    targets = [resolved]
+
+                targets = [t for t in targets if isinstance(t, dict) and str(t.get("sale_id") or "")]
+                if not targets:
                     return {"code": 1, "error": "could not resolve sale_id from sale-info"}
 
-                name = str(target.get("collection_name") or collection_name or sale_id)
-                price_yuan = target.get("price_yuan")
-                max_buy = target.get("max_buy")
-                buy_num = quantity
-                if max_buy is not None and max_buy > 0:
-                    buy_num = min(buy_num, int(max_buy))
+                buy_nums = [
+                    resolve_sale_rush_buy_quantity(quantity, t.get("max_buy")) for t in targets
+                ]
+                total_qty = max(1, sum(buy_nums))
 
-                on_sale_time = target.get("on_sale_time")
-                if isinstance(on_sale_time, datetime):
-                    seconds_until = (on_sale_time - datetime.now()).total_seconds()
-                    if seconds_until > 0:
-                        print(
-                            f"[sale-rush] sale_id={sale_id} name={name!r} "
-                            f"opens at {on_sale_time.strftime('%Y-%m-%d %H:%M:%S')} "
-                            f"({seconds_until:.0f}s away) price={price_yuan}yuan num={buy_num}",
-                            flush=True,
-                        )
-                        if wait_for_start:
-                            _wait_until_start(on_sale_time)
-                        else:
-                            print("[sale-rush] --no-wait set, attempting order before official start…", flush=True)
-                    else:
-                        print(
-                            f"[sale-rush] sale_id={sale_id} name={name!r} "
-                            f"price={price_yuan}yuan num={buy_num}",
-                            flush=True,
-                        )
-                else:
+                def refresh_auto_targets() -> list[dict] | dict:
+                    if not auto_pick:
+                        return targets
+                    refreshed = resolve_auto_sale_rush_targets(client)
+                    if refreshed.get("code") not in (None, 0):
+                        return refreshed
+                    next_targets = refreshed.get("targets") or []
+                    if not next_targets:
+                        return {"code": 1, "error": "no auto sale targets after refresh"}
+                    return next_targets
+
+                earliest = None
+                for target in targets:
+                    on_sale_time = target.get("on_sale_time")
+                    if isinstance(on_sale_time, datetime):
+                        if earliest is None or on_sale_time < earliest:
+                            earliest = on_sale_time
+
+                if (
+                    earliest is not None
+                    and wait_for_start
+                    and (earliest - datetime.now()).total_seconds() > 0
+                ):
+                    seconds_until = (earliest - datetime.now()).total_seconds()
                     print(
-                        f"[sale-rush] sale_id={sale_id} name={name!r} "
-                        f"price={price_yuan}yuan num={buy_num}",
+                        f"[sale-rush] earliest opens at {earliest.strftime('%Y-%m-%d %H:%M:%S')} "
+                        f"({seconds_until:.0f}s away); waiting…",
                         flush=True,
                     )
-
-                order_payload = build_sale_order_payload(
-                    buy_num,
-                    payment_platform,
-                    extra=extra_payload,
-                )
+                    warmup_sale_rush(client)
+                    _wait_until_start(earliest)
+                    if auto_pick:
+                        refreshed = refresh_auto_targets()
+                        if isinstance(refreshed, dict) and refreshed.get("code") not in (None, 0):
+                            return refreshed
+                        if isinstance(refreshed, list) and refreshed:
+                            targets = refreshed
+                            buy_nums = [
+                                resolve_sale_rush_buy_quantity(quantity, t.get("max_buy"))
+                                for t in targets
+                            ]
+                            total_qty = max(1, sum(buy_nums))
 
                 if dry_run:
+                    dry_results = []
+                    for target, buy_num in zip(targets, buy_nums):
+                        sale_id = str(target.get("sale_id") or "")
+                        name = str(target.get("collection_name") or collection_name or sale_id)
+                        on_sale_time = target.get("on_sale_time")
+                        dry_results.append(
+                            {
+                                "sale_id": sale_id,
+                                "group_id": target.get("group_id"),
+                                "collection_name": name,
+                                "price_yuan": target.get("price_yuan"),
+                                "quantity": buy_num,
+                                "sale_status": to_int(target.get("sale_status")),
+                                "on_sale_time": (
+                                    on_sale_time.isoformat()
+                                    if isinstance(on_sale_time, datetime)
+                                    else None
+                                ),
+                                "payload": build_sale_order_payload(
+                                    buy_num,
+                                    payment_platform,
+                                    extra=extra_payload,
+                                ),
+                            }
+                        )
                     return {
                         "code": 0,
                         "dry_run": True,
-                        "sale_id": sale_id,
-                        "group_id": target.get("group_id"),
-                        "collection_name": name,
-                        "price_yuan": price_yuan,
-                        "quantity": buy_num,
-                        "payload": order_payload,
-                        "on_sale_time": on_sale_time.isoformat() if isinstance(on_sale_time, datetime) else None,
+                        "auto": auto_pick,
+                        "multi": len(dry_results) > 1,
+                        "results": dry_results,
+                        **(dry_results[0] if len(dry_results) == 1 else {}),
                     }
 
                 warmup_sale_rush(client)
-
-                captcha_params, captcha_err = resolve_geetest_captcha_params(
-                    device_host=device_host,
-                    captcha_mode=parsed.captcha_mode,
-                    captcha_timeout=parsed.captcha_timeout,
-                    captcha_id=parsed.captcha_id,
-                    captcha_headed=getattr(parsed, "captcha_headed", False),
-                    context=f"sale_id={sale_id}",
-                    prefer_app=False,
-                )
-                if captcha_err:
-                    return {"code": 1, "error": captcha_err}
-
-                order_path = build_sale_order_path(config, sale_id, captcha_params or {})
-                report_task_progress(0, max(1, buy_num))
-
-                create_result: dict | None = None
-                started_at = time.monotonic()
-                attempt = 0
-                while time.monotonic() - started_at <= retry_window:
-                    attempt += 1
-                    create_result = client_post_with_rate_limit_retry(
-                        client,
-                        order_path,
-                        order_payload,
-                        label=f"sale-rush attempt={attempt}",
-                    )
-                    if is_success(create_result):
-                        break
-                    if is_auth_failure(create_result):
-                        return create_result
-                    code = create_result.get("code") if isinstance(create_result, dict) else None
-                    message = create_result.get("message") if isinstance(create_result, dict) else ""
-                    print(
-                        f"[sale-rush] create failed code={code} message={message!r}; "
-                        f"retry in {retry_interval:.2f}s…",
-                        flush=True,
-                    )
-                    if time.monotonic() - started_at + retry_interval > retry_window:
-                        break
-                    time.sleep(retry_interval)
-
-                if not isinstance(create_result, dict) or not is_success(create_result):
-                    return create_result or {"code": 1, "error": "sale-rush create order failed"}
+                report_task_progress(0, total_qty)
 
                 ibox_token = getattr(client, "token", None) or (
                     (saved_session or {}).get("token") if saved_session else None
                 )
-                total_yuan = (
-                    float(price_yuan) * buy_num
-                    if price_yuan is not None
-                    else None
+
+                results: list[dict] = []
+                done_qty = 0
+
+                for index, (target, buy_num) in enumerate(zip(targets, buy_nums), start=1):
+                    sale_id = str(target.get("sale_id") or "")
+                    name = str(target.get("collection_name") or collection_name or sale_id)
+                    price_yuan = target.get("price_yuan")
+                    sale_status = to_int(target.get("sale_status"))
+                    on_sale_time = target.get("on_sale_time")
+
+                    if isinstance(on_sale_time, datetime):
+                        seconds_until = (on_sale_time - datetime.now()).total_seconds()
+                        if seconds_until > 0 and not wait_for_start:
+                            print(
+                                f"[sale-rush] [{index}/{len(targets)}] sale_id={sale_id} name={name!r} "
+                                f"opens at {on_sale_time.strftime('%Y-%m-%d %H:%M:%S')} "
+                                f"({seconds_until:.0f}s away) price={price_yuan}yuan num={buy_num}",
+                                flush=True,
+                            )
+                            print(
+                                "[sale-rush] --no-wait set, attempting order before official start…",
+                                flush=True,
+                            )
+                        else:
+                            print(
+                                f"[sale-rush] [{index}/{len(targets)}] sale_id={sale_id} name={name!r} "
+                                f"price={price_yuan}yuan num={buy_num} status={sale_status}",
+                                flush=True,
+                            )
+                    else:
+                        print(
+                            f"[sale-rush] [{index}/{len(targets)}] sale_id={sale_id} name={name!r} "
+                            f"price={price_yuan}yuan num={buy_num} status={sale_status}",
+                            flush=True,
+                        )
+
+                    order_payload = build_sale_order_payload(
+                        buy_num,
+                        payment_platform,
+                        extra=extra_payload,
+                    )
+
+                    create_result: dict | None = None
+                    captcha_failed = False
+                    max_captcha_rounds = 6
+
+                    for captcha_round in range(1, max_captcha_rounds + 1):
+                        captcha_params, captcha_err = resolve_geetest_captcha_params(
+                            device_host=device_host,
+                            captcha_mode=parsed.captcha_mode,
+                            captcha_timeout=parsed.captcha_timeout,
+                            captcha_id=parsed.captcha_id,
+                            captcha_headed=False,
+                            context=f"sale_id={sale_id} round={captcha_round}",
+                            prefer_app=False,
+                            sale_rush=True,
+                            app_group_id=str(target.get("group_id") or ""),
+                            app_sale_id=str(target.get("sale_id") or ""),
+                            app_sale_link=str(target.get("link") or ""),
+                            app_collection_name=str(target.get("collection_name") or ""),
+                        )
+                        if captcha_err:
+                            results.append(
+                                {
+                                    "code": 1,
+                                    "error": captcha_err,
+                                    "paid": False,
+                                    "sale_id": sale_id,
+                                    "collection_name": name,
+                                    "quantity": buy_num,
+                                }
+                            )
+                            captcha_failed = True
+                            break
+
+                        order_deadline = time.monotonic() + retry_window
+                        attempt = 0
+                        captcha_rejected = False
+                        create_result = None
+
+                        while time.monotonic() <= order_deadline:
+                            attempt += 1
+                            order_path = build_sale_order_path(
+                                config, sale_id, captcha_params or {}
+                            )
+                            create_result = client_post_with_rate_limit_retry(
+                                client,
+                                order_path,
+                                order_payload,
+                                label=(
+                                    f"sale-rush sale_id={sale_id} "
+                                    f"captcha_round={captcha_round} attempt={attempt}"
+                                ),
+                            )
+                            if is_success(create_result):
+                                break
+                            if is_auth_failure(create_result):
+                                return create_result
+                            code = (
+                                create_result.get("code")
+                                if isinstance(create_result, dict)
+                                else None
+                            )
+                            message = (
+                                create_result.get("message")
+                                if isinstance(create_result, dict)
+                                else ""
+                            )
+                            if is_captcha_related_failure(create_result):
+                                print(
+                                    f"[sale-rush] captcha rejected code={code} "
+                                    f"message={message!r}; re-solving…",
+                                    flush=True,
+                                )
+                                captcha_rejected = True
+                                break
+                            print(
+                                f"[sale-rush] create failed code={code} message={message!r}; "
+                                f"retry in {retry_interval:.2f}s…",
+                                flush=True,
+                            )
+                            if time.monotonic() + retry_interval > order_deadline:
+                                break
+                            time.sleep(retry_interval)
+
+                        if isinstance(create_result, dict) and is_success(create_result):
+                            break
+                        if not captcha_rejected:
+                            break
+
+                    if captcha_failed:
+                        continue
+
+                    if not isinstance(create_result, dict) or not is_success(create_result):
+                        results.append(
+                            create_result
+                            if isinstance(create_result, dict)
+                            else {
+                                "code": 1,
+                                "error": "sale-rush create order failed",
+                                "paid": False,
+                                "sale_id": sale_id,
+                                "collection_name": name,
+                                "quantity": buy_num,
+                            }
+                        )
+                        continue
+
+                    total_yuan = (
+                        float(price_yuan) * buy_num if price_yuan is not None else None
+                    )
+                    payment = complete_purchase_payment(
+                        client,
+                        create_result=create_result,
+                        consignment_password=consignment_password,
+                        ibox_token=str(ibox_token or ""),
+                        app_version=app_version,
+                        max_price_yuan=total_yuan,
+                        config=config,
+                        payment_initiator_type=0,
+                        label=f"sale-rush sale_id={sale_id}",
+                    )
+                    paid = bool(payment.get("paid"))
+                    if paid:
+                        done_qty += buy_num
+                        report_task_progress(done_qty, total_qty)
+                    results.append(
+                        {
+                            "code": 0 if paid else 1,
+                            "message": "ok" if paid else (payment.get("error") or "wallet payment failed"),
+                            "paid": paid,
+                            "sale_id": sale_id,
+                            "group_id": target.get("group_id"),
+                            "collection_name": name,
+                            "price_yuan": price_yuan,
+                            "quantity": buy_num,
+                            "create": create_result,
+                            "payment": payment,
+                        }
+                    )
+
+                paid_count = sum(1 for item in results if item.get("paid"))
+                any_paid = paid_count > 0
+                total_bought = sum(int(item.get("quantity") or 0) for item in results if item.get("paid"))
+                summary = (
+                    f"首发抢购完成 {paid_count}/{len(results)} 个活动，"
+                    f"共购买 {total_bought} 件"
                 )
-                payment = complete_purchase_payment(
-                    client,
-                    create_result=create_result,
-                    consignment_password=consignment_password,
-                    ibox_token=str(ibox_token or ""),
-                    app_version=app_version,
-                    max_price_yuan=total_yuan,
-                    config=config,
-                    payment_initiator_type=0,
-                    label="sale-rush",
-                )
-                paid = bool(payment.get("paid"))
-                if paid:
-                    report_task_progress(buy_num, buy_num)
-                return {
-                    "code": 0 if paid else 1,
-                    "message": "ok" if paid else (payment.get("error") or "wallet payment failed"),
-                    "paid": paid,
-                    "sale_id": sale_id,
-                    "group_id": target.get("group_id"),
-                    "collection_name": name,
-                    "price_yuan": price_yuan,
-                    "quantity": buy_num,
-                    "create": create_result,
-                    "payment": payment,
+                print(f"[sale-rush] {summary}", flush=True)
+                payload = {
+                    "code": 0 if any_paid else 1,
+                    "message": summary,
+                    "summary": summary,
+                    "paid": any_paid,
+                    "auto": auto_pick,
+                    "multi": len(results) > 1,
+                    "results": results,
+                    "paidCount": paid_count,
+                    "totalQuantity": total_bought,
                 }
+                if len(results) == 1:
+                    payload.update(results[0])
+                return payload
 
             operation = sale_rush_operation
         elif cmd == "wanted-buy":

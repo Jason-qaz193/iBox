@@ -28,6 +28,7 @@ public class MainHook implements IXposedHookLoadPackage {
     public static volatile String lastCaptchaOutput       = null;
     public static volatile String lastCaptchaId           = null;
     public static volatile long   lastCaptchaTimestampMs  = 0;
+    public static volatile Context appContext               = null;
 
     @Override
     public void handleLoadPackage(XC_LoadPackage.LoadPackageParam lpparam) throws Throwable {
@@ -42,6 +43,7 @@ public class MainHook implements IXposedHookLoadPackage {
                 if (server != null) return;
                 
                 Context appContext = (Context) param.thisObject;
+                MainHook.appContext = appContext.getApplicationContext();
                 XposedBridge.log("[iBoxRPC] Application Context acquired. Starting TCP Server...");
 
                 try {

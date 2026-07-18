@@ -583,6 +583,113 @@ python qq_bot.py
 - 藏品名含空格时用引号：`寄售 - 123456 "2026喜糖熊猫" 199 1`
 - 支付密码会出现在 QQ 聊天记录中；若 `allow_all_senders: true`，任何私聊机器人的人都能操作，请谨慎使用
 
+## 云端混合部署（方案 A）
+
+目标：**云端 VPS 跑 `qq_bot.py` + `run.py`，手机留在家中**，通过 VPN/内网穿透让云端访问手机的 RPC（27042）和无线 adb（5555）。
+
+```text
+云端 VPS                         家里（Tailscale / frp）
+┌─────────────────┐               ┌────────────────────────┐
+│ python qq_bot.py│  ──VPN/frp──► │ 手机 iBox + LSPosed     │
+│ config.yaml     │               │ :27042 RPC  :5555 adb   │
+└─────────────────┘               └────────────────────────┘
+```
+
+### 1. 手机侧（一次性）
+
+1. 安装 **LSPosed RPC 模块**（或 `rpc_bridge.js`），重启 iBox，确认本机可连 `27042`
+2. 开启 **无线 adb**（USB 连电脑时执行一次）：
+
+```bash
+adb tcpip 5555
+```
+
+3. 手机设置：**常亮、勿休眠、固定 WiFi**
+4. 安装 **Tailscale**（推荐）或配置 **frp** 暴露 `27042` 与 `5555`
+
+Tailscale 示例：手机和 VPS 都登录同一账号，记下手机 Tailscale IP（如 `100.64.0.5`）。
+
+### 2. 云端 VPS
+
+```bash
+git clone <repo> && cd ibox
+pip install -r requirements.txt
+apt install adb   # 或 Android platform-tools
+
+cp config/config.example.yaml config/config.yaml
+cp config/qq_bot.example.yaml config/qq_bot.yaml
+```
+
+编辑 `config/config.yaml`：
+
+```yaml
+device_host: "100.64.0.5"   # 手机 Tailscale IP，或 frp 映射的 RPC 地址
+
+adb:
+  host: "100.64.0.5"
+  port: 5555
+```
+
+编辑 `config/qq_bot.yaml`（**不要**用 `--usb`）：
+
+```yaml
+onebot_http_url: "http://127.0.0.1:3000"   # NapCat 与 bot 同机或可达
+onebot_ws_url: "ws://127.0.0.1:3001"
+run_args: []   # device_host / adb 已在 config.yaml
+```
+
+NapCat 可装在云端同一台 VPS，QQ 指令 → OneBot → `qq_bot.py` → `run.py`。
+
+### 3. 验证连通性
+
+在云端执行：
+
+```bash
+python run.py bridge-check
+# 或
+python scripts/cloud_bridge_check.py
+```
+
+期望输出 `"ready": true`，且 `rpc.ok` 与 `adb.ok` 均为 true。
+
+### 4. 启动
+
+```bash
+# 前台
+python qq_bot.py
+
+# 后台（示例）
+nohup python qq_bot.py >> logs/qq_bot.log 2>&1 &
+```
+
+### frp 参考（不用 Tailscale 时）
+
+在 VPS 的 `frpc.toml` 中映射手机端口（手机跑 frpc，或网关转发）：
+
+```toml
+[[proxies]]
+name = "ibox-rpc"
+type = "tcp"
+localIP = "127.0.0.1"
+localPort = 27042
+remotePort = 27042
+
+[[proxies]]
+name = "ibox-adb"
+type = "tcp"
+localIP = "127.0.0.1"
+localPort = 5555
+remotePort = 15555
+```
+
+则 `config.yaml` 填 VPS 公网 IP，`device_host` 用 RPC 端口，`adb.port` 用 `15555`。
+
+### 注意
+
+- **首发抢购**同时需要 RPC + adb；寄售/合成等仅需 RPC
+- 不要把 27042/5555 裸奔公网，优先 Tailscale 或带认证的隧道
+- 手机断电、App 被杀、RPC 断开时，云端任务会失败；可用 `bridge-check` 定期巡检
+
 ## 关键文件
 
 | 文件 | 作用 |
@@ -590,7 +697,9 @@ python qq_bot.py
 | [run.py](/Users/neatli/code/ibox/run.py) | 命令行入口 |
 | [src/frida_client.py](/Users/neatli/code/ibox/src/frida_client.py) | RPC 客户端，负责登录后携带 token 调接口 |
 | [frida/rpc_bridge.js](/Users/neatli/code/ibox/frida/rpc_bridge.js) | 注入 App 内部执行加解密 |
-| [config/config.example.yaml](/Users/neatli/code/ibox/config/config.example.yaml) | iBox 配置模板 |
+| [config/config.example.yaml](/Users/neatli/code/ibox/config/config.example.yaml) | iBox 配置模板（含云端 device_host / adb） |
+| [deploy/tencent-cvm/README.md](/Users/neatli/code/ibox/deploy/tencent-cvm/README.md) | 腾讯云 CVM 部署指南 |
+| [scripts/deploy_tencent_cvm.sh](/Users/neatli/code/ibox/scripts/deploy_tencent_cvm.sh) | CVM 一键安装脚本 |
 | [qq_bot.py](/Users/neatli/code/ibox/qq_bot.py) | QQ OneBot 指令桥接 |
 | [config/qq_bot.example.yaml](/Users/neatli/code/ibox/config/qq_bot.example.yaml) | QQ 机器人配置模板 |
 

@@ -1,0 +1,18 @@
+[Unit]
+Description=iBox QQ OneBot bridge
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=@IBOX_USER@
+WorkingDirectory=@IBOX_ROOT@
+Environment=PATH=@IBOX_ROOT@/.venv/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=@IBOX_ROOT@/.venv/bin/python @IBOX_ROOT@/qq_bot.py
+Restart=on-failure
+RestartSec=10
+StandardOutput=append:@IBOX_ROOT@/logs/qq_bot.log
+StandardError=append:@IBOX_ROOT@/logs/qq_bot.log
+
+[Install]
+WantedBy=multi-user.target

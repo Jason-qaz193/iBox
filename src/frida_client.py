@@ -431,6 +431,18 @@ def peek_rpc_captcha(device_host: str = RPC_HOST) -> dict | None:
     return None
 
 
+def rpc_open_web(device_host: str, url: str) -> bool:
+    """Ask the LSPosed RPC module to open an H5 page inside the iBox app."""
+    target = str(url or "").strip()
+    if not target:
+        return False
+    try:
+        resp = rpc({"type": "open-web", "url": target}, device_host=device_host, timeout=12.0)
+        return bool(resp.get("ok"))
+    except Exception:
+        return False
+
+
 def poll_captcha(
     device_host: str = RPC_HOST,
     timeout: float = 120.0,

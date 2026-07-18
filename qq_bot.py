@@ -16,9 +16,9 @@ Chat commands (private or allowed group):
   下架 13800138000 - 123456 藏品名 99 1
   求购 13800138000 - 123456 藏品名 6 6
   捡漏 13800138000 - 123456 藏品名 5000 1
-  点对点 13800138000 - 123456 藏品名 5 1 orderId|藏品ID
-  合成 13800138000 - 3
-  首发 13800138000 - 123456 藏品名 1
+  点对点-B手机号-A手机号-验证码-寄售密码-支付密码-藏品名-价格-数量
+  合成-手机号-验证码-活动名-合成数量
+  首发 13800138000 - 123456
 
 If default_mobile / default_pay_password are set in config/qq_bot.yaml,
 you can omit mobile/password, e.g.:
@@ -29,6 +29,7 @@ you can omit mobile/password, e.g.:
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import inspect
 import json
 import os
@@ -38,6 +39,11 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urlencode, urlparse, urlunparse, parse_qsl
+
+from src.session_store import (
+    default_session_path,
+    delete_account_session,
+)
 
 import requests
 import yaml
@@ -50,6 +56,100 @@ except ImportError as exc:
 ROOT = Path(__file__).resolve().parent
 MOBILE_RE = re.compile(r"^1\d{10}$")
 CODE_RE = re.compile(r"^-|\d{4,8}$")
+SMS_CODE_RE = re.compile(r"^\d{4,8}$")
+MOBILE_OWNERS_PATH = ROOT / "config" / "qq_mobile_owners.json"
+
+
+def load_mobile_owners(path: Path = MOBILE_OWNERS_PATH) -> dict[str, str]:
+    if not path.exists():
+        return {}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    return {str(mobile): str(qq_id) for mobile, qq_id in data.items() if mobile and qq_id}
+
+
+def save_mobile_owners(owners: dict[str, str], path: Path = MOBILE_OWNERS_PATH) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {str(mobile): str(qq_id) for mobile, qq_id in sorted(owners.items())}
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
+        f.write("\n")
+
+
+def qq_user_id_from_event(event: dict) -> str:
+    user_id = event.get("user_id") or (event.get("sender") or {}).get("user_id")
+    return str(user_id).strip() if user_id not in (None, "") else ""
+
+
+def extract_operating_mobile(
+    task_ctx: TaskContext | None,
+    run_cmd: list[str] | None,
+) -> str:
+    if task_ctx is not None:
+        if task_ctx.seller_mobile:
+            return str(task_ctx.seller_mobile)
+        if task_ctx.mobile and "→" not in task_ctx.mobile:
+            return str(task_ctx.mobile)
+        if task_ctx.buyer_mobile:
+            return str(task_ctx.buyer_mobile)
+    if run_cmd and len(run_cmd) >= 2:
+        candidate = str(run_cmd[1])
+        if MOBILE_RE.fullmatch(candidate):
+            return candidate
+    return ""
+
+
+def task_owner_keys(
+    event: dict,
+    task_ctx: TaskContext | None,
+    run_cmd: list[str] | None,
+) -> list[str]:
+    keys: list[str] = []
+    if task_ctx is not None:
+        for mobile in (task_ctx.seller_mobile, task_ctx.buyer_mobile):
+            if mobile and MOBILE_RE.fullmatch(str(mobile)):
+                keys.append(f"mobile:{mobile}")
+        if not keys and task_ctx.mobile and "→" not in task_ctx.mobile:
+            keys.append(f"mobile:{task_ctx.mobile}")
+    if not keys and run_cmd and len(run_cmd) >= 2:
+        candidate = str(run_cmd[1])
+        if MOBILE_RE.fullmatch(candidate):
+            keys.append(f"mobile:{candidate}")
+    if not keys:
+        qq_id = qq_user_id_from_event(event)
+        if qq_id:
+            keys.append(f"qq:{qq_id}")
+        else:
+            keys.append(f"msg:{event.get('message_id') or 'unknown'}")
+    return list(dict.fromkeys(keys))
+
+
+def command_uses_saved_session(run_cmd: list[str] | None, defaults: dict) -> bool:
+    if not run_cmd or len(run_cmd) < 3:
+        return False
+    code = str(run_cmd[2])
+    if code == "-":
+        return True
+    default_code = str(defaults.get("default_code") if defaults.get("default_code") is not None else "-")
+    return code == default_code == "-"
+
+
+class TaskSupersededError(Exception):
+    """Raised when a newer command from the same QQ user replaces this task."""
+
+
+@dataclass
+class OwnerTaskSlot:
+    task: asyncio.Task
+    cancel_event: asyncio.Event
+    proc_holder: list
+    task_no: int
+    label: str = ""
 
 
 def subprocess_env() -> dict[str, str]:
@@ -76,7 +176,9 @@ def task_collection_display_name(ctx: TaskContext, result: dict | None = None) -
     if name:
         return name
     if isinstance(result, dict):
-        fallback = str(result.get("collectionName") or "").strip()
+        fallback = str(
+            result.get("collection_name") or result.get("collectionName") or ""
+        ).strip()
         if fallback:
             return fallback
     return "该藏品"
@@ -95,6 +197,7 @@ TASK_ACTIONS = frozenset(
         "wanted-buy",
         "market-buy",
         "market-purchase",
+        "p2p-trade",
         "synthesis-auto",
         "sale-rush",
     }
@@ -133,6 +236,11 @@ TASK_START_META = {
         "price_label": "购买价格",
         "verb": "点对点",
     },
+    "p2p-trade": {
+        "collection_label": "当前点对点藏品",
+        "price_label": "交易价格",
+        "verb": "点对点",
+    },
     "synthesis-auto": {
         "verb": "合成",
     },
@@ -150,6 +258,7 @@ TASK_DONE_META = {
     "wanted-buy": {"label": "发求购完成了", "count_label": "求购数量"},
     "market-buy": {"label": "捡漏完成了", "count_label": "购买数量"},
     "market-purchase": {"label": "点对点完成了", "count_label": "购买个数"},
+    "p2p-trade": {"label": "点对点完成了", "count_label": "购买个数", "consign_label": "寄售个数"},
     "synthesis-auto": {"label": "合成完成了", "count_label": "合成次数"},
     "sale-rush": {"label": "首发抢购完成了", "count_label": "购买数量"},
 }
@@ -165,30 +274,30 @@ class TaskContext:
     target_count: int | None = None
     consign_order_id: str = ""
     digital_collection_id: str = ""
+    seller_mobile: str = ""
+    buyer_mobile: str = ""
+    session_code: str = "-"
+    consign_password: str = ""
+    pay_password: str = ""
 
 
 HELP_TEXT = """iBox QQ 指令帮助
 
 登陆-手机号-验证码
+点对点-B手机号-A手机号-验证码-寄售密码-支付密码-藏品名-价格-数量
 寄售-手机号-验证码-寄售密码-藏品名-价格-数量
 下架-手机号-验证码-支付密码-藏品名-价格-数量
 求购-手机号-验证码-寄售密码-藏品名-最低成交价-数量
 捡漏-手机号-验证码-支付密码-藏品名-价格-数量
-点对点-手机号-验证码-支付密码-藏品名-价格-数量-寄售ID|藏品ID
-点对点-手机号-验证码-支付密码-藏品名-价格-数量-寄售ID1|藏品ID1、寄售ID2|藏品ID2
-合成-手机号-验证码-合成数量
-首发-手机号-验证码-支付密码-藏品名-数量
+合成-手机号-验证码-活动名-合成数量
+首发-手机号-验证码-支付密码
 
 说明：
-- 参数用 - 分隔；也支持用空格分隔（验证码可写 - 表示复用已保存 session）
-- 点对点：填写 B 寄售成功后返回的「寄售ID|藏品ID」；多个用 、 连接可一次买完
-- 批量扫货：若 B 独占某价位，A 可用「捡漏」按价格+数量批量买，无需逐个寄售ID
-- 全自动：config/qq_bot.yaml 配置 p2p_auto 后，B 寄售成功会自动触发 A 点对点购买
-- 求购：把仓库藏品卖给市场上已有的求购单
-- 点对点流程：B「寄售」→ A「点对点」（可手动粘贴 ID，或开启 p2p_auto 全自动）
-- 合成数量可省略，省略则尽量全部合成；材料用尽或活动结束时会推送本轮结果并继续监控新活动
-- 首发/优先购：按藏品名匹配首发活动，开售后自动下单并钱包支付
-- 藏品名含空格请用引号，例如：寄售-123456-"2026喜糖熊猫"-199-1
+- 参数用 - 分隔；验证码可写 - 表示复用已保存 session
+- 点对点（一条指令）：B 寄售 + A 仅购买 B 的挂单，无需配置 yaml
+- B、A 需各登录一次保存 session；寄售密码与支付密码分别填 B、A 的密码
+- 合成可指定活动名（或 synthetic id），只合成匹配的活动；数量可省略
+- 藏品名含空格请用引号，例如：点对点-B手机号-A手机号--寄售密码-支付密码-"藏品名"-价格-数量
 """
 
 
@@ -208,9 +317,9 @@ def tokenize_message(text: str) -> list[str]:
     if not text:
         return []
 
-    # 寄售-手机号-验证码-... 整行用 - 分隔（与帮助格式一致）
+    # 寄售-手机号-验证码-... 整行用 - 分隔；连续 -- 表示该字段留空（记为 -）
     if "-" in text and not re.search(r"\s", text):
-        parts = [part.strip() for part in text.split("-") if part.strip()]
+        parts = [part.strip() if part.strip() else "-" for part in text.split("-")]
         if len(parts) >= 2:
             return parts
 
@@ -301,19 +410,51 @@ def is_consign_ref_bundle(value: str) -> bool:
     return is_consign_order_id_token(text)
 
 
+def resolve_p2p_pair(p2p_auto) -> dict | None:
+    """Parse flat p2p_auto config: seller/buyer mobiles and optional seller uid."""
+    if not p2p_auto or not isinstance(p2p_auto, dict):
+        return None
+    if p2p_auto.get("enabled") is False:
+        return None
+    buyer_mobile = str(p2p_auto.get("buyer_mobile") or p2p_auto.get("buyer") or "").strip()
+    if not buyer_mobile:
+        return None
+    return {
+        "seller_mobile": str(p2p_auto.get("seller_mobile") or p2p_auto.get("seller") or "").strip(),
+        "seller_uid": str(p2p_auto.get("seller_uid") or "").strip(),
+        "buyer_mobile": buyer_mobile,
+        "buyer_code": str(
+            p2p_auto.get("buyer_code") or p2p_auto.get("code") or ""
+        ).strip(),
+        "buyer_pay_password": str(
+            p2p_auto.get("buyer_pay_password")
+            or p2p_auto.get("pay_password")
+            or p2p_auto.get("password")
+            or ""
+        ).strip(),
+    }
+
+
 def resolve_p2p_auto_buyer(seller_mobile: str, config: dict) -> dict | None:
     auto = config.get("p2p_auto")
     if not auto:
         return None
     seller = str(seller_mobile or "").strip()
-    if not seller:
-        return None
+    pair = resolve_p2p_pair(auto)
+    if pair:
+        cfg_seller = pair.get("seller_mobile") or ""
+        if cfg_seller and seller and cfg_seller != seller:
+            return None
+        return pair
     if isinstance(auto, dict):
         entry = auto.get(seller)
         if isinstance(entry, str) and entry.strip():
-            return {"buyer_mobile": entry.strip()}
+            return {"buyer_mobile": entry.strip(), "seller_mobile": seller}
         if isinstance(entry, dict):
-            return entry
+            merged = dict(entry)
+            if seller and not merged.get("seller_mobile"):
+                merged["seller_mobile"] = seller
+            return merged
     if isinstance(auto, list):
         for item in auto:
             if not isinstance(item, dict):
@@ -330,9 +471,11 @@ def build_p2p_auto_purchase_cmd(
     buyer_password: str,
     collection_name: str,
     price: float,
-    consign_ids: list[str],
+    quantity: int,
+    seller_mobile: str = "",
+    seller_uid: str = "",
 ) -> list[str]:
-    qty = max(1, len(consign_ids))
+    qty = max(1, int(quantity))
     run_cmd = [
         "market-purchase",
         buyer_mobile,
@@ -346,8 +489,22 @@ def build_p2p_auto_purchase_cmd(
         "--quantity",
         str(qty),
     ]
-    if consign_ids:
-        run_cmd += ["--consign-order-id", "、".join(str(item) for item in consign_ids)]
+    if seller_uid:
+        run_cmd += ["--seller-uid", seller_uid]
+    elif seller_mobile:
+        run_cmd += ["--seller-mobile", seller_mobile]
+    return run_cmd
+
+
+def append_p2p_seller_args(run_cmd: list[str], pair: dict | None) -> list[str]:
+    if not pair:
+        return run_cmd
+    seller_uid = str(pair.get("seller_uid") or "").strip()
+    seller_mobile = str(pair.get("seller_mobile") or "").strip()
+    if seller_uid:
+        return run_cmd + ["--seller-uid", seller_uid]
+    if seller_mobile:
+        return run_cmd + ["--seller-mobile", seller_mobile]
     return run_cmd
 
 
@@ -371,7 +528,7 @@ def parse_direct_purchase_args(
 
     tail = tokens[idx:]
     if len(tail) < 3:
-        raise ValueError("参数不足，需要：藏品名 价格 数量 [寄售ID|藏品ID]")
+        raise ValueError("参数不足，需要：藏品名 价格 数量")
     consign_order_id = ""
     digital_collection_id = ""
     if len(tail) >= 4:
@@ -391,7 +548,7 @@ def parse_direct_purchase_args(
             consign_order_id = last
             tail = tail[:-1]
     if len(tail) < 3:
-        raise ValueError("参数不足，需要：藏品名 价格 数量 [寄售ID|藏品ID]")
+        raise ValueError("参数不足，需要：藏品名 价格 数量")
 
     qty = int(tail[-1])
     price = float(tail[-2])
@@ -409,11 +566,12 @@ def parse_direct_purchase_args(
 
 def parse_synthesis_args(
     tokens: list[str], start: int, defaults: dict
-) -> tuple[str, str, int | None]:
+) -> tuple[str, str, int | None, str | None]:
     idx = start
     mobile = defaults.get("default_mobile") or ""
     code = defaults.get("default_code", "-")
     target_count: int | None = None
+    activity_filter: str | None = None
 
     if idx < len(tokens) and MOBILE_RE.fullmatch(tokens[idx]):
         mobile = tokens[idx]
@@ -422,23 +580,76 @@ def parse_synthesis_args(
         code = tokens[idx]
         idx += 1
     if idx < len(tokens):
-        if len(tokens) - idx != 1:
-            raise ValueError("用法：合成 [手机号] [验证码|-] [合成数量]")
-        try:
-            target_count = int(tokens[idx])
-        except ValueError as exc:
-            raise ValueError("合成数量必须是正整数") from exc
-        if target_count <= 0:
+        if len(tokens) - idx == 1:
+            tail = tokens[idx]
+            if re.fullmatch(r"\d+", tail):
+                target_count = int(tail)
+            else:
+                activity_filter = tail.strip()
+        else:
+            if re.fullmatch(r"\d+", tokens[-1]):
+                target_count = int(tokens[-1])
+                activity_filter = " ".join(tokens[idx:-1]).strip()
+            else:
+                activity_filter = " ".join(tokens[idx:]).strip()
+        if target_count is not None and target_count <= 0:
             raise ValueError("合成数量必须大于 0")
 
     if not mobile:
         raise ValueError("缺少手机号，请在命令中提供或在 config/qq_bot.yaml 设置 default_mobile")
-    return mobile, code, target_count
+    if activity_filter == "":
+        activity_filter = None
+    return mobile, code, target_count, activity_filter
+
+
+def is_p2p_trade_tokens(tokens: list[str], start: int = 1) -> bool:
+    return (
+        len(tokens) > start + 1
+        and MOBILE_RE.fullmatch(tokens[start] or "")
+        and MOBILE_RE.fullmatch(tokens[start + 1] or "")
+    )
+
+
+def parse_p2p_trade_args(
+    tokens: list[str], start: int, defaults: dict
+) -> tuple[str, str, str, str, str, str, float, int]:
+    if not is_p2p_trade_tokens(tokens, start):
+        raise ValueError(
+            "点对点合并指令格式：点对点-B手机号-A手机号-验证码-寄售密码-支付密码-藏品名-价格-数量"
+        )
+    idx = start
+    seller_mobile = tokens[idx]
+    idx += 1
+    buyer_mobile = tokens[idx]
+    idx += 1
+    code = defaults.get("default_code", "-")
+    if idx < len(tokens) and CODE_RE.fullmatch(tokens[idx]):
+        code = tokens[idx]
+        idx += 1
+    tail = tokens[idx:]
+    if len(tail) < 5:
+        raise ValueError(
+            "参数不足，需要：寄售密码 支付密码 藏品名 价格 数量"
+        )
+    consign_password = tail[0]
+    pay_password = tail[1]
+    qty = int(tail[-1])
+    price = float(tail[-2])
+    name = " ".join(tail[2:-2]).strip()
+    if not re.fullmatch(r"\d{4,12}", consign_password):
+        raise ValueError("缺少有效的寄售密码")
+    if not re.fullmatch(r"\d{4,12}", pay_password):
+        raise ValueError("缺少有效的支付密码")
+    if not name:
+        raise ValueError("缺少藏品名")
+    if qty <= 0:
+        raise ValueError("数量必须大于 0")
+    return seller_mobile, buyer_mobile, code, consign_password, pay_password, name, price, qty
 
 
 def parse_sale_rush_args(
     tokens: list[str], start: int, defaults: dict
-) -> tuple[str, str, str, str, int]:
+) -> tuple[str, str, str, str]:
     idx = start
     mobile = defaults.get("default_mobile") or ""
     code = defaults.get("default_code", "-")
@@ -454,20 +665,13 @@ def parse_sale_rush_args(
         password = tokens[idx]
         idx += 1
 
-    if len(tokens) - idx < 2:
-        raise ValueError("参数不足，需要：藏品名 数量")
+    name = " ".join(tokens[idx:]).strip()
 
-    qty = int(tokens[-1])
-    name = " ".join(tokens[idx:-1]).strip()
     if not mobile:
         raise ValueError("缺少手机号，请在命令中提供或在 config/qq_bot.yaml 设置 default_mobile")
     if not password:
         raise ValueError("缺少支付密码，请在命令中提供或在 config/qq_bot.yaml 设置 default_pay_password")
-    if not name:
-        raise ValueError("缺少藏品名")
-    if qty <= 0:
-        raise ValueError("数量必须大于 0")
-    return mobile, code, password, name, qty
+    return mobile, code, password, name
 
 
 def parse_command(text: str, defaults: dict) -> tuple[str, list[str] | None, TaskContext | None]:
@@ -534,7 +738,7 @@ def parse_command(text: str, defaults: dict) -> tuple[str, list[str] | None, Tas
             name,
         ]
         if action == "consign-create":
-            run_cmd += ["--出售价格", str(price), "--出售数量", str(qty)]
+            run_cmd += ["--出售价格", str(price), "--出售数量", str(qty), "--fast"]
         else:
             run_cmd += ["--下架价格", str(price), "--下架数量", str(qty)]
         ctx = TaskContext(
@@ -618,10 +822,35 @@ def parse_command(text: str, defaults: dict) -> tuple[str, list[str] | None, Tas
         )
         return action, run_cmd, ctx
 
+    if action == "market-purchase" and is_p2p_trade_tokens(tokens, 1):
+        seller_mobile, buyer_mobile, code, consign_password, pay_password, name, price, qty = (
+            parse_p2p_trade_args(tokens, 1, defaults)
+        )
+        ctx = TaskContext(
+            action="p2p-trade",
+            mobile=f"{seller_mobile}→{buyer_mobile}",
+            seller_mobile=seller_mobile,
+            buyer_mobile=buyer_mobile,
+            session_code=code,
+            consign_password=consign_password,
+            pay_password=pay_password,
+            collection_name=name,
+            price=price,
+            quantity=qty,
+        )
+        return "p2p-trade", None, ctx
+
     if action == "market-purchase":
         mobile, code, password, name, price, qty, consign_order_id, digital_collection_id, _ = (
             parse_direct_purchase_args(tokens, 1, defaults)
         )
+        pair = resolve_p2p_pair(defaults.get("p2p_auto"))
+        if pair and pair.get("buyer_mobile"):
+            mobile = pair["buyer_mobile"]
+            if pair.get("buyer_code"):
+                code = pair["buyer_code"]
+            if pair.get("buyer_pay_password"):
+                password = pair["buyer_pay_password"]
         purchase_ref = consign_order_id
         if consign_order_id and digital_collection_id:
             purchase_ref = f"{consign_order_id}|{digital_collection_id}"
@@ -640,6 +869,12 @@ def parse_command(text: str, defaults: dict) -> tuple[str, list[str] | None, Tas
         ]
         if purchase_ref:
             run_cmd += ["--consign-order-id", purchase_ref]
+        else:
+            run_cmd = append_p2p_seller_args(run_cmd, pair)
+            if not pair or (not pair.get("seller_mobile") and not pair.get("seller_uid")):
+                raise ValueError(
+                    "点对点请使用合并指令：点对点-B手机号-A手机号-验证码-寄售密码-支付密码-藏品名-价格-数量"
+                )
         ctx = TaskContext(
             action=action,
             mobile=mobile,
@@ -652,31 +887,41 @@ def parse_command(text: str, defaults: dict) -> tuple[str, list[str] | None, Tas
         return action, run_cmd, ctx
 
     if action == "synthesis-auto":
-        mobile, code, target_count = parse_synthesis_args(tokens, 1, defaults)
+        mobile, code, target_count, activity_filter = parse_synthesis_args(tokens, 1, defaults)
         run_cmd = ["synthesis-auto", mobile, code]
         if target_count is not None:
             run_cmd += ["--target-count", str(target_count)]
-        ctx = TaskContext(action=action, mobile=mobile, target_count=target_count)
+        if activity_filter:
+            if re.fullmatch(r"\d{4,6}", activity_filter):
+                run_cmd += ["--synthetic-id", activity_filter]
+            else:
+                run_cmd += ["--activity-name", activity_filter]
+        ctx = TaskContext(
+            action=action,
+            mobile=mobile,
+            target_count=target_count,
+            collection_name=activity_filter or "",
+        )
         return action, run_cmd, ctx
 
     if action == "sale-rush":
-        mobile, code, password, name, qty = parse_sale_rush_args(tokens, 1, defaults)
+        mobile, code, password, name = parse_sale_rush_args(tokens, 1, defaults)
         run_cmd = [
             "sale-rush",
             mobile,
             code,
             "--支付密码",
             password,
-            "--collection-name",
-            name,
-            "--quantity",
-            str(qty),
         ]
+        if name:
+            run_cmd += ["--collection-name", name]
+        else:
+            run_cmd += ["--auto"]
+        run_cmd += ["--captcha-mode", "app"]
         ctx = TaskContext(
             action=action,
             mobile=mobile,
             collection_name=name,
-            quantity=qty,
         )
         return action, run_cmd, ctx
 
@@ -728,9 +973,16 @@ def format_task_start(ctx: TaskContext) -> str:
     line1 = format_login_success_line(ctx.mobile)
     if ctx.action == "synthesis-auto":
         count_label = str(ctx.target_count) if ctx.target_count is not None else "全部"
+        activity_label = f"活动={ctx.collection_name}，" if ctx.collection_name else ""
         line2 = (
-            f"当前合成任务：数量={count_label}，将持续监控合成活动；"
+            f"当前合成任务：{activity_label}数量={count_label}，将持续监控匹配活动；"
             "材料用尽或活动结束时会自动推送合成藏品名称与数量。"
+        )
+    elif ctx.action == "sale-rush":
+        collection_label = ctx.collection_name or "首页所有抢购中活动"
+        line2 = (
+            f"{meta['collection_label']}：{collection_label}，"
+            "将购买每个活动允许的最大数量，自动过验证码并完成支付，请耐心等待推送！"
         )
     elif ctx.action == "market-purchase" and ctx.consign_order_id:
         ref = ctx.consign_order_id
@@ -926,20 +1178,20 @@ def explain_task_failure(ctx: TaskContext, data: dict | None, exit_code: int) ->
         return f"{mobile}-{verb}失败\n原因：{reason}\n建议：{tip}"
 
     if "no matching consignment listings" in combined_lower or "请选择藏品" in combined:
-        reason = f"未找到「{ctx.collection_name or '该藏品'}」在 {format_price(ctx.price)} 元价位的可购买挂单。"
-        if "请选择藏品" in combined or "digitalcollectionid" in combined_lower:
-            reason = "点对点缺少藏品ID，或寄售信息不完整。"
-            tip = (
-                "请复制 B 寄售成功回复中的整段「寄售ID|藏品ID」用于点对点；"
-                "批量购买可改用「捡漏」指令。"
-            )
+        reason = f"未找到「{ctx.collection_name or '该藏品'}」在 {format_price(ctx.price)} 元价位、来自指定卖家的可购买挂单。"
+        if "seller uid not found" in combined_lower:
+            reason = "无法解析卖家账号，点对点购买未能启动。"
+            tip = "请让卖家先用「登陆-手机号-验证码」登录一次以保存 session，或在 p2p_auto 中填写 seller_uid。"
+        elif "请选择藏品" in combined or "digitalcollectionid" in combined_lower:
+            reason = "点对点直购缺少藏品ID。"
+            tip = "推荐在 config/qq_bot.yaml 配置 p2p_auto，B 寄售后自动购买；或补充寄售ID|藏品ID。"
         elif ctx.consign_order_id:
-            tip = (
-                "请复制 B 返回的完整「寄售ID|藏品ID」；"
-                "若 B 独占该价位，A 也可直接用「捡漏」批量购买。"
-            )
+            tip = "请确认寄售ID|藏品ID完整；若 B 独占该价位，也可改用「捡漏」。"
         else:
-            tip = "请确认卖家已完成寄售、价格一致，或补充寄售ID|藏品ID后再试。"
+            tip = (
+                "请确认 B 已完成寄售、价格一致，且 config/qq_bot.yaml 中 p2p_auto 的 seller_mobile 正确；"
+                "也可手动发「点对点-藏品名-价格-数量」。"
+            )
         return f"{mobile}-{verb}失败\n原因：{reason}\n建议：{tip}"
 
     if "failed to list market consignments" in combined_lower:
@@ -1015,6 +1267,51 @@ def explain_task_failure(ctx: TaskContext, data: dict | None, exit_code: int) ->
     )
 
 
+def format_p2p_trade_reply(
+    ctx: TaskContext,
+    *,
+    consign_data: dict | None,
+    consign_exit: int,
+    purchase_data: dict | None,
+    purchase_exit: int,
+) -> str:
+    label = f"{ctx.seller_mobile}→{ctx.buyer_mobile}"
+    name = ctx.collection_name or task_collection_display_name(ctx, _task_result_dict(consign_data))
+    consign_result = _task_result_dict(consign_data)
+    purchase_result = _task_result_dict(purchase_data)
+    consign_ok = int(consign_result.get("successCount") or 0) if isinstance(consign_result, dict) else 0
+    consign_fail = int(consign_result.get("failCount") or 0) if isinstance(consign_result, dict) else 0
+    if consign_ok <= 0:
+        return explain_task_failure(
+            TaskContext(
+                action="consign-create",
+                mobile=ctx.seller_mobile,
+                collection_name=ctx.collection_name,
+                price=ctx.price,
+                quantity=ctx.quantity,
+            ),
+            consign_data,
+            consign_exit,
+        )
+    if purchase_data is None:
+        return (
+            f"{label}-点对点完成了，藏品名称：{name}，"
+            f"寄售个数：{consign_ok}，购买个数：0（未执行购买）"
+        )
+    buy_ok = int(purchase_result.get("successCount") or 0) if isinstance(purchase_result, dict) else 0
+    buy_unsold = int(purchase_result.get("unsoldCount", purchase_result.get("failCount") or 0) or 0) if isinstance(purchase_result, dict) else 0
+    if purchase_exit == 0 and buy_ok >= consign_ok:
+        return (
+            f"{label}-点对点完成了，藏品名称：{name}，"
+            f"寄售个数：{consign_ok}，购买个数：{buy_ok}"
+        )
+    return (
+        f"{label}-点对点部分完成，藏品名称：{name}，"
+        f"寄售个数：{consign_ok}（失败 {consign_fail}），"
+        f"购买个数：{buy_ok}，未买到：{buy_unsold}"
+    )
+
+
 def format_task_reply(ctx: TaskContext, data: dict | None, raw: str, exit_code: int) -> str:
     mobile = ctx.mobile
     result = _task_result_dict(data)
@@ -1070,13 +1367,35 @@ def format_task_reply(ctx: TaskContext, data: dict | None, raw: str, exit_code: 
             price_text = format_price(ctx.price)
             if ctx.action == "sale-rush":
                 result = _task_result_dict(data)
+                if isinstance(result, dict) and result.get("multi") and isinstance(
+                    result.get("results"), list
+                ):
+                    lines = [
+                        f"{mobile}-{meta['label']}，{result.get('summary') or '多活动抢购结果'}："
+                    ]
+                    for item in result["results"]:
+                        if not isinstance(item, dict):
+                            continue
+                        paid = bool(item.get("paid"))
+                        status = "已支付" if paid else "未支付"
+                        item_name = str(item.get("collection_name") or item.get("collectionName") or "该藏品")
+                        price_text = format_price(
+                            float(item["price_yuan"]) if item.get("price_yuan") is not None else None
+                        )
+                        buy_qty = int(item.get("quantity") or 0)
+                        lines.append(
+                            f"- {item_name}（sale_id={item.get('sale_id')}）"
+                            f" 价格：{price_text}，{meta['count_label']}：{buy_qty}（{status}）"
+                        )
+                    return "\n".join(lines)
                 paid = bool(result.get("paid")) if isinstance(result, dict) else False
                 price_val = result.get("price_yuan") if isinstance(result, dict) else None
                 price_text = format_price(float(price_val) if price_val is not None else ctx.price)
+                buy_qty = int(result.get("quantity") or 0) if isinstance(result, dict) else 0
                 status = "已支付" if paid else "订单已创建但未支付"
                 return (
                     f"{mobile}-{meta['label']}，藏品名称：{task_collection_display_name(ctx, result)}，"
-                    f"价格：{price_text}，{meta['count_label']}：{ctx.quantity}（{status}）"
+                    f"价格：{price_text}，{meta['count_label']}：{buy_qty}（{status}）"
                 )
             return (
                 f"{mobile}-{meta['label']}，藏品名称：{task_collection_display_name(ctx, result)}，"
@@ -1141,6 +1460,9 @@ async def run_ibox_command_streaming(
     extra_args: list[str],
     timeout: int,
     on_line,
+    *,
+    cancel_event: asyncio.Event | None = None,
+    proc_holder: list | None = None,
 ) -> tuple[int, str]:
     cmd = [sys.executable, str(ROOT / "run.py"), *extra_args, *run_args]
     proc = await asyncio.create_subprocess_exec(
@@ -1150,12 +1472,19 @@ async def run_ibox_command_streaming(
         stderr=asyncio.subprocess.STDOUT,
         env=subprocess_env(),
     )
+    if proc_holder is not None:
+        proc_holder[:] = [proc]
     chunks: list[str] = []
     unlimited = timeout <= 0
     deadline = None if unlimited else asyncio.get_running_loop().time() + timeout
     try:
         assert proc.stdout is not None
         while True:
+            if cancel_event is not None and cancel_event.is_set():
+                if proc.returncode is None:
+                    proc.kill()
+                await proc.wait()
+                raise TaskSupersededError("superseded by new command")
             if deadline is not None:
                 remaining = deadline - asyncio.get_running_loop().time()
                 if remaining <= 0:
@@ -1164,7 +1493,34 @@ async def run_ibox_command_streaming(
                     raise subprocess.TimeoutExpired(cmd, timeout)
                 line_bytes = await asyncio.wait_for(proc.stdout.readline(), timeout=remaining)
             else:
-                line_bytes = await proc.stdout.readline()
+                if cancel_event is not None:
+                    read_task = asyncio.create_task(proc.stdout.readline())
+                    cancel_task = asyncio.create_task(cancel_event.wait())
+                    done, pending = await asyncio.wait(
+                        {read_task, cancel_task},
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
+                    for task in pending:
+                        task.cancel()
+                    if cancel_task in done and cancel_event.is_set():
+                        read_task.cancel()
+                        with contextlib.suppress(asyncio.CancelledError):
+                            await read_task
+                        if proc.returncode is None:
+                            proc.kill()
+                        await proc.wait()
+                        raise TaskSupersededError("superseded by new command")
+                    try:
+                        line_bytes = read_task.result()
+                    except asyncio.CancelledError:
+                        if cancel_event.is_set():
+                            if proc.returncode is None:
+                                proc.kill()
+                            await proc.wait()
+                            raise TaskSupersededError("superseded by new command") from None
+                        raise
+                else:
+                    line_bytes = await proc.stdout.readline()
             if not line_bytes:
                 break
             line = decode_subprocess_bytes(line_bytes)
@@ -1173,6 +1529,8 @@ async def run_ibox_command_streaming(
             if inspect.isawaitable(maybe_coro):
                 await maybe_coro
         return_code = await proc.wait()
+        if cancel_event is not None and cancel_event.is_set():
+            raise TaskSupersededError("superseded by new command")
         return return_code, "".join(chunks)
     except asyncio.TimeoutError as exc:
         if proc.returncode is None:
@@ -1294,11 +1652,22 @@ class QQBot:
         )
         self._task_seq = 0
         self._background_tasks: set[asyncio.Task] = set()
+        self._owner_tasks: dict[str, OwnerTaskSlot] = {}
+        self.session_path = Path(default_session_path(str(ROOT)))
+        self._mobile_owners = load_mobile_owners()
         self.defaults = {
             "default_mobile": str(config.get("default_mobile") or "").strip(),
             "default_code": str(config.get("default_code") if config.get("default_code") is not None else "-"),
             "default_pay_password": str(config.get("default_pay_password") or "").strip(),
+            "p2p_auto": config.get("p2p_auto"),
         }
+        pair = resolve_p2p_pair(config.get("p2p_auto"))
+        if pair and (config.get("p2p_auto") or {}).get("enabled") is not False:
+            print(
+                f"[qq-bot] p2p_auto enabled: seller={pair.get('seller_mobile') or '-'} "
+                f"→ buyer={pair.get('buyer_mobile') or '-'}",
+                flush=True,
+            )
         if self._max_concurrent > 0:
             print(f"[qq-bot] max_concurrent_tasks={self._max_concurrent}", flush=True)
         if self.bot_qq:
@@ -1331,6 +1700,110 @@ class QQBot:
         else:
             self.client.send_private(int(event["user_id"]), message)
 
+    def _qq_user_id(self, event: dict) -> str:
+        return qq_user_id_from_event(event)
+
+    def _get_mobile_owner(self, mobile: str) -> str:
+        mobile = str(mobile or "").strip()
+        if not mobile:
+            return ""
+        return str(self._mobile_owners.get(mobile) or "").strip()
+
+    def _set_mobile_owner(self, mobile: str, qq_id: str) -> None:
+        mobile = str(mobile or "").strip()
+        qq_id = str(qq_id or "").strip()
+        if not mobile or not qq_id:
+            return
+        self._mobile_owners[mobile] = qq_id
+        save_mobile_owners(self._mobile_owners)
+
+    def _is_mobile_owner(self, mobile: str, event: dict) -> bool:
+        owner = self._get_mobile_owner(mobile)
+        qq_id = self._qq_user_id(event)
+        if not owner:
+            return True
+        return owner == qq_id
+
+    async def _takeover_mobile_account(self, mobile: str) -> None:
+        mobile = str(mobile or "").strip()
+        if not mobile:
+            return
+        await self._cancel_owner_task(f"mobile:{mobile}")
+        await asyncio.to_thread(delete_account_session, str(self.session_path), mobile)
+        self._mobile_owners.pop(mobile, None)
+        save_mobile_owners(self._mobile_owners)
+        print(f"[qq-bot] mobile takeover cleared session/tasks for {mobile}", flush=True)
+
+    async def _validate_command_access(
+        self,
+        event: dict,
+        action: str,
+        run_cmd: list[str] | None,
+        task_ctx: TaskContext | None,
+    ) -> None:
+        qq_id = self._qq_user_id(event)
+        mobile = extract_operating_mobile(task_ctx, run_cmd)
+
+        if action == "login":
+            if not run_cmd or len(run_cmd) < 3:
+                return
+            login_mobile = str(run_cmd[1])
+            login_code = str(run_cmd[2])
+            if not SMS_CODE_RE.fullmatch(login_code):
+                raise ValueError(
+                    f"登录 {login_mobile} 必须提供新的短信验证码（4-8 位数字），不能使用 -"
+                )
+            owner = self._get_mobile_owner(login_mobile)
+            if owner and owner != qq_id:
+                await self._takeover_mobile_account(login_mobile)
+                await asyncio.to_thread(
+                    self.reply,
+                    event,
+                    f"{login_mobile}-已清除该账号在其它 QQ 的登录与任务，正在重新登录…",
+                )
+            return
+
+        if not mobile:
+            return
+        if command_uses_saved_session(run_cmd, self.defaults) and not self._is_mobile_owner(mobile, event):
+            raise ValueError(
+                f"手机号 {mobile} 已在其他 QQ 登录。"
+                f"请先发送：登录-{mobile}-验证码"
+            )
+
+    def _task_owner_keys(
+        self,
+        event: dict,
+        task_ctx: TaskContext | None,
+        run_cmd: list[str] | None,
+    ) -> list[str]:
+        return task_owner_keys(event, task_ctx, run_cmd)
+
+    async def _cancel_owner_task(self, owner_key: str) -> bool:
+        slot = self._owner_tasks.get(owner_key)
+        if slot is None or slot.task.done():
+            self._owner_tasks.pop(owner_key, None)
+            return False
+        print(
+            f"[qq-bot] cancelling task#{slot.task_no} ({slot.label}) for {owner_key}",
+            flush=True,
+        )
+        slot.cancel_event.set()
+        proc = slot.proc_holder[0] if slot.proc_holder else None
+        if proc is not None and proc.returncode is None:
+            try:
+                proc.kill()
+            except ProcessLookupError:
+                pass
+        slot.task.cancel()
+        try:
+            await slot.task
+        except (asyncio.CancelledError, TaskSupersededError, Exception):
+            pass
+        if slot.task.done():
+            self._owner_tasks.pop(owner_key, None)
+        return True
+
     async def _maybe_auto_p2p_purchase(
         self,
         event: dict,
@@ -1343,12 +1816,8 @@ class QQBot:
         result = _task_result_dict(data)
         if not isinstance(result, dict):
             return
-        consign_ids = [
-            str(item).strip()
-            for item in (result.get("consignOrderIds") or [])
-            if str(item).strip()
-        ]
-        if not consign_ids:
+        success_count = int(result.get("successCount") or seller_ctx.quantity or 0)
+        if success_count <= 0:
             return
         buyer_mobile = str(
             buyer_cfg.get("buyer_mobile") or buyer_cfg.get("buyer") or ""
@@ -1375,7 +1844,7 @@ class QQBot:
                     self.reply,
                     event,
                     f"{seller_ctx.mobile}-寄售已完成，但 p2p_auto 未配置买家支付密码，"
-                    "请手动发送点对点指令。",
+                    "请手动发送「点对点-藏品名-价格-数量」。",
                 )
             except Exception as exc:
                 print(f"[qq-bot] failed to send p2p_auto notice: {exc}", flush=True)
@@ -1383,47 +1852,248 @@ class QQBot:
 
         collection_name = task_collection_display_name(seller_ctx, result)
         price = float(seller_ctx.price or result.get("price_yuan") or 0)
+        seller_uid = str(result.get("seller_uid") or buyer_cfg.get("seller_uid") or "").strip()
+        seller_mobile = str(
+            buyer_cfg.get("seller_mobile") or seller_ctx.mobile or ""
+        ).strip()
         run_cmd = build_p2p_auto_purchase_cmd(
             buyer_mobile=buyer_mobile,
             buyer_code=buyer_code,
             buyer_password=buyer_password,
             collection_name=collection_name,
             price=price,
-            consign_ids=consign_ids,
+            quantity=success_count,
+            seller_mobile=seller_mobile,
+            seller_uid=seller_uid,
         )
         buyer_ctx = TaskContext(
             action="market-purchase",
             mobile=buyer_mobile,
             collection_name=collection_name,
             price=price,
-            quantity=len(consign_ids),
+            quantity=success_count,
         )
         try:
             await asyncio.to_thread(
                 self.reply,
                 event,
-                f"{seller_ctx.mobile}-寄售已完成，已自动触发 {buyer_mobile} 点对点购买 "
-                f"（{len(consign_ids)} 件）…",
+                f"{seller_ctx.mobile}-寄售已完成，已自动触发 {buyer_mobile} 购买 "
+                f"（{success_count} 件，仅买 {seller_mobile or seller_uid} 的挂单）…",
             )
         except Exception as exc:
             print(f"[qq-bot] failed to send p2p_auto start notice: {exc}", flush=True)
-        self._spawn_command_task(event, "market-purchase", run_cmd, buyer_ctx)
+        await self._spawn_command_task(event, "market-purchase", run_cmd, buyer_ctx, supersede=False)
 
-    def _spawn_command_task(
+    async def _run_p2p_trade(
+        self,
+        event: dict,
+        task_ctx: TaskContext,
+        task_no: int,
+        cancel_event: asyncio.Event,
+        proc_holder: list,
+    ) -> None:
+        label = task_ctx.mobile
+        seller = task_ctx.seller_mobile
+        buyer = task_ctx.buyer_mobile
+        code = task_ctx.session_code or "-"
+        try:
+            print(f"[qq-bot] task#{task_no} p2p-trade start ({label})", flush=True)
+            await asyncio.to_thread(
+                self.reply,
+                event,
+                f"{label}-{TASK_START_META['p2p-trade']['verb']}任务已开始\n"
+                f"藏品：{task_ctx.collection_name}，价格：{format_price(task_ctx.price)}，"
+                f"数量：{task_ctx.quantity}\n"
+                f"流程：{seller} 寄售 → {buyer} 购买（仅 {seller} 挂单）",
+            )
+            consign_cmd = [
+                "consign-create",
+                seller,
+                code,
+                "--支付密码",
+                task_ctx.consign_password,
+                "--藏品名字",
+                task_ctx.collection_name,
+                "--出售价格",
+                str(task_ctx.price),
+                "--出售数量",
+                str(task_ctx.quantity),
+                "--fast",
+            ]
+            progress = TaskProgressTracker()
+            task_timeout = 0 if self.timeout <= 0 else self.timeout
+
+            async def handle_consign_progress(line: str) -> None:
+                update = progress.feed(line)
+                if update is None:
+                    return
+                done, total, decile = update
+                message = format_task_progress(
+                    TaskContext(action="consign-create", mobile=seller, collection_name=task_ctx.collection_name),
+                    done,
+                    total,
+                    decile,
+                )
+                try:
+                    await asyncio.to_thread(self.reply, event, message)
+                except Exception as exc:
+                    print(f"[qq-bot] failed to send progress: {exc}", flush=True)
+
+            consign_exit, consign_output = await run_ibox_command_streaming(
+                consign_cmd,
+                self.run_args,
+                task_timeout,
+                handle_consign_progress,
+                cancel_event=cancel_event,
+                proc_holder=proc_holder,
+            )
+            consign_data = extract_json_result(consign_output)
+            consign_result = _task_result_dict(consign_data)
+            consign_ok = int(consign_result.get("successCount") or 0) if isinstance(consign_result, dict) else 0
+            if consign_ok <= 0:
+                reply = format_p2p_trade_reply(
+                    task_ctx,
+                    consign_data=consign_data,
+                    consign_exit=consign_exit,
+                    purchase_data=None,
+                    purchase_exit=1,
+                )
+                await asyncio.to_thread(self.reply, event, reply)
+                return
+
+            purchase_cmd = [
+                "market-purchase",
+                buyer,
+                code,
+                "--支付密码",
+                task_ctx.pay_password,
+                "--collection-name",
+                task_ctx.collection_name,
+                "--price",
+                str(task_ctx.price),
+                "--quantity",
+                str(consign_ok),
+                "--seller-mobile",
+                seller,
+            ]
+            progress = TaskProgressTracker()
+
+            async def handle_purchase_progress(line: str) -> None:
+                update = progress.feed(line)
+                if update is None:
+                    return
+                done, total, decile = update
+                message = format_task_progress(
+                    TaskContext(action="market-purchase", mobile=buyer, collection_name=task_ctx.collection_name),
+                    done,
+                    total,
+                    decile,
+                )
+                try:
+                    await asyncio.to_thread(self.reply, event, message)
+                except Exception as exc:
+                    print(f"[qq-bot] failed to send progress: {exc}", flush=True)
+
+            purchase_exit, purchase_output = await run_ibox_command_streaming(
+                purchase_cmd,
+                self.run_args,
+                task_timeout,
+                handle_purchase_progress,
+                cancel_event=cancel_event,
+                proc_holder=proc_holder,
+            )
+            purchase_data = extract_json_result(purchase_output)
+            reply = format_p2p_trade_reply(
+                task_ctx,
+                consign_data=consign_data,
+                consign_exit=consign_exit,
+                purchase_data=purchase_data,
+                purchase_exit=purchase_exit,
+            )
+            await asyncio.to_thread(self.reply, event, reply)
+        except TaskSupersededError:
+            print(f"[qq-bot] task#{task_no} p2p-trade superseded ({label})", flush=True)
+        except asyncio.CancelledError:
+            print(f"[qq-bot] task#{task_no} p2p-trade cancelled ({label})", flush=True)
+            raise
+        except subprocess.TimeoutExpired:
+            await asyncio.to_thread(
+                self.reply,
+                event,
+                f"{label}-点对点失败\n原因：任务执行超时。",
+            )
+        except Exception as exc:
+            print(f"[qq-bot] task#{task_no} p2p-trade failed: {exc}", flush=True)
+            await asyncio.to_thread(self.reply, event, f"点对点任务执行异常：{exc}")
+        finally:
+            print(f"[qq-bot] task#{task_no} done ({label})", flush=True)
+
+    async def _spawn_command_task(
         self,
         event: dict,
         action: str,
         run_cmd: list[str] | None,
         task_ctx: TaskContext | None,
+        *,
+        supersede: bool = True,
     ) -> None:
+        owner_keys = self._task_owner_keys(event, task_ctx, run_cmd)
+        if supersede:
+            cancelled = False
+            for owner_key in owner_keys:
+                if await self._cancel_owner_task(owner_key):
+                    cancelled = True
+            if cancelled:
+                try:
+                    await asyncio.to_thread(
+                        self.reply,
+                        event,
+                        "已取消上一个任务，开始执行新指令。",
+                    )
+                except Exception as exc:
+                    print(f"[qq-bot] failed to send supersede notice: {exc}", flush=True)
+
+        if action in TASK_ACTIONS and task_ctx is not None and action != "p2p-trade":
+            try:
+                await asyncio.to_thread(self.reply, event, format_task_start(task_ctx))
+            except Exception as exc:
+                print(f"[qq-bot] failed to send start notice: {exc}", flush=True)
+
         self._task_seq += 1
         task_no = self._task_seq
+        cancel_event = asyncio.Event()
+        proc_holder: list = []
+        label = task_ctx.mobile if task_ctx is not None else action
         bg = asyncio.create_task(
-            self._execute_command(event, action, run_cmd, task_ctx, task_no),
+            self._execute_command(
+                event,
+                action,
+                run_cmd,
+                task_ctx,
+                task_no,
+                cancel_event,
+                proc_holder,
+            ),
             name=f"ibox-{task_no}-{action}",
         )
         self._background_tasks.add(bg)
-        bg.add_done_callback(self._background_tasks.discard)
+        slot = OwnerTaskSlot(
+            task=bg,
+            cancel_event=cancel_event,
+            proc_holder=proc_holder,
+            task_no=task_no,
+            label=label,
+        )
+        for owner_key in owner_keys:
+            self._owner_tasks[owner_key] = slot
+
+        def _done(task: asyncio.Task) -> None:
+            self._background_tasks.discard(task)
+            for key, registered in list(self._owner_tasks.items()):
+                if registered.task is task:
+                    self._owner_tasks.pop(key, None)
+
+        bg.add_done_callback(_done)
 
     async def _execute_command(
         self,
@@ -1432,12 +2102,30 @@ class QQBot:
         run_cmd: list[str] | None,
         task_ctx: TaskContext | None,
         task_no: int,
+        cancel_event: asyncio.Event,
+        proc_holder: list,
     ) -> None:
         if self._task_semaphore is not None:
             async with self._task_semaphore:
-                await self._run_command(event, action, run_cmd, task_ctx, task_no)
+                await self._run_command(
+                    event,
+                    action,
+                    run_cmd,
+                    task_ctx,
+                    task_no,
+                    cancel_event,
+                    proc_holder,
+                )
         else:
-            await self._run_command(event, action, run_cmd, task_ctx, task_no)
+            await self._run_command(
+                event,
+                action,
+                run_cmd,
+                task_ctx,
+                task_no,
+                cancel_event,
+                proc_holder,
+            )
 
     async def _run_command(
         self,
@@ -1446,7 +2134,18 @@ class QQBot:
         run_cmd: list[str] | None,
         task_ctx: TaskContext | None,
         task_no: int,
+        cancel_event: asyncio.Event,
+        proc_holder: list,
     ) -> None:
+        if action == "p2p-trade" and task_ctx is not None:
+            await self._run_p2p_trade(
+                event,
+                task_ctx,
+                task_no,
+                cancel_event,
+                proc_holder,
+            )
+            return
         if run_cmd is None:
             return
 
@@ -1499,15 +2198,30 @@ class QQBot:
                     self.run_args,
                     task_timeout,
                     handle_progress_line,
+                    cancel_event=cancel_event,
+                    proc_holder=proc_holder,
                 )
             else:
                 cmd_timeout = self.timeout if self.timeout > 0 else 0
-                exit_code, output = await asyncio.to_thread(
-                    run_ibox_command, run_cmd, self.run_args, cmd_timeout
+
+                async def handle_line(_line: str) -> None:
+                    return None
+
+                exit_code, output = await run_ibox_command_streaming(
+                    run_cmd,
+                    self.run_args,
+                    cmd_timeout,
+                    handle_line,
+                    cancel_event=cancel_event,
+                    proc_holder=proc_holder,
                 )
             data = extract_json_result(output)
             if action == "login":
                 reply = format_login_reply(data, output, exit_code)
+                if exit_code == 0 and run_cmd and len(run_cmd) >= 2:
+                    qq_id = self._qq_user_id(event)
+                    if qq_id:
+                        self._set_mobile_owner(str(run_cmd[1]), qq_id)
             elif action in TASK_ACTIONS and task_ctx is not None:
                 if action == "synthesis-auto" and synthesis_terminal_reply_sent:
                     reply = None
@@ -1525,7 +2239,20 @@ class QQBot:
                 and exit_code == 0
                 and task_ctx is not None
             ):
+                qq_id = self._qq_user_id(event)
+                if qq_id and task_ctx.mobile:
+                    self._set_mobile_owner(task_ctx.mobile, qq_id)
                 await self._maybe_auto_p2p_purchase(event, task_ctx, data)
+            elif exit_code == 0 and action not in {"login", "sms", "help"}:
+                qq_id = self._qq_user_id(event)
+                mobile = extract_operating_mobile(task_ctx, run_cmd)
+                if qq_id and mobile and not self._get_mobile_owner(mobile):
+                    self._set_mobile_owner(mobile, qq_id)
+        except TaskSupersededError:
+            print(f"[qq-bot] task#{task_no} superseded ({label})", flush=True)
+        except asyncio.CancelledError:
+            print(f"[qq-bot] task#{task_no} cancelled ({label})", flush=True)
+            raise
         except subprocess.TimeoutExpired:
             try:
                 if action in TASK_ACTIONS and task_ctx is not None:
@@ -1593,16 +2320,19 @@ class QQBot:
             except Exception as exc:
                 print(f"[qq-bot] failed to send reply: {exc}", flush=True)
             return
-        if run_cmd is None:
+        if run_cmd is None and action != "p2p-trade":
             return
 
-        if action in TASK_ACTIONS and task_ctx is not None:
+        try:
+            await self._validate_command_access(event, action, run_cmd, task_ctx)
+        except Exception as exc:
             try:
-                self.reply(event, format_task_start(task_ctx))
-            except Exception as exc:
-                print(f"[qq-bot] failed to send start notice: {exc}", flush=True)
+                self.reply(event, f"指令解析/执行失败：{exc}")
+            except Exception as reply_exc:
+                print(f"[qq-bot] failed to send reply: {reply_exc}", flush=True)
+            return
 
-        self._spawn_command_task(event, action, run_cmd, task_ctx)
+        await self._spawn_command_task(event, action, run_cmd, task_ctx)
 
 
 async def main_async():

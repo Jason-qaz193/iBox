@@ -3,6 +3,15 @@ package com.neatli.iboxrpc;
 import android.util.Base64;
 import org.json.JSONObject;
 
+import android.content.Context;
+import android.content.Intent;
+import android.net.Uri;
+import android.os.Handler;
+import android.os.Looper;
+
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
+
 import java.io.BufferedReader;
 import java.io.BufferedWriter;
 import java.io.InputStreamReader;
@@ -306,6 +315,41 @@ public class RpcServer implements Runnable {
                     return res;
                 }
 
+                // ── open-web ────────────────────────────────────────────────
+                // Open an H5 page inside the iBox app (CommonWebViewActivity).
+                if ("open-web".equals(type)) {
+                    String url = cmd.optString("url", "").trim();
+                    if (url.isEmpty()) {
+                        res.put("ok", false);
+                        res.put("error", "url is required");
+                        return res;
+                    }
+                    Context ctx = MainHook.appContext;
+                    if (ctx == null) {
+                        res.put("ok", false);
+                        res.put("error", "app context not ready");
+                        return res;
+                    }
+                    final String[] err = new String[1];
+                    final CountDownLatch latch = new CountDownLatch(1);
+                    new Handler(Looper.getMainLooper()).post(() -> {
+                        try {
+                            openWebInApp(ctx, url);
+                        } catch (Throwable t) {
+                            err[0] = t.getMessage();
+                        }
+                        latch.countDown();
+                    });
+                    latch.await(8, TimeUnit.SECONDS);
+                    if (err[0] != null) {
+                        res.put("ok", false);
+                        res.put("error", err[0]);
+                    } else {
+                        res.put("ok", true);
+                    }
+                    return res;
+                }
+
                 res.put("ok", false);
                 res.put("error", "Unknown command type: " + type);
 
@@ -316,6 +360,61 @@ public class RpcServer implements Runnable {
                 } catch (Exception ignore) {}
             }
             return res;
+        }
+
+        private void openWebInApp(Context ctx, String url) throws Exception {
+            Exception last = null;
+            String[] extraKeys = {"url", "link", "webUrl", "h5Url", "pageUrl", "loadUrl", "targetUrl", "jumpUrl"};
+            try {
+                Class<?> impl = XposedHelpers.findClass("com.webview.server.WebViewServiceImpl", classLoader);
+                Object inst = null;
+                for (String field : new String[]{"INSTANCE", "instance", "sInstance"}) {
+                    try {
+                        inst = XposedHelpers.getStaticObjectField(impl, field);
+                        if (inst != null) break;
+                    } catch (Throwable ignore) {}
+                }
+                if (inst == null) {
+                    inst = XposedHelpers.newInstance(impl);
+                }
+                for (String method : new String[]{"openWebUrl", "openWeb", "commonWebPage", "startWebPage", "loadUrl"}) {
+                    try {
+                        XposedHelpers.callMethod(inst, method, url);
+                        return;
+                    } catch (Throwable t) {
+                        last = new Exception(t);
+                    }
+                }
+            } catch (Throwable t) {
+                last = new Exception(t);
+            }
+
+            for (String key : extraKeys) {
+                try {
+                    Intent intent = new Intent();
+                    intent.setClassName("com.box.art", "com.webview.CommonWebViewActivity");
+                    intent.putExtra(key, url);
+                    intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+                    ctx.startActivity(intent);
+                    return;
+                } catch (Throwable t) {
+                    last = new Exception(t);
+                }
+            }
+
+            try {
+                Intent intent = new Intent(Intent.ACTION_VIEW, Uri.parse(url));
+                intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+                ctx.startActivity(intent);
+                return;
+            } catch (Throwable t) {
+                last = new Exception(t);
+            }
+
+            if (last != null) {
+                throw last;
+            }
+            throw new Exception("unable to open web url in app");
         }
     }
 }

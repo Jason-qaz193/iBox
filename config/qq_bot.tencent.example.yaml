@@ -1,0 +1,21 @@
+# Copy to config/qq_bot.yaml on Tencent Cloud CVM.
+# NapCat 建议与 qq_bot 装在同一台 CVM。
+
+onebot_http_url: "http://127.0.0.1:3000"
+onebot_ws_url: "ws://127.0.0.1:3001"
+access_token: ""
+
+bot_qq: 0
+allow_all_senders: true
+allowed_users: []
+allowed_groups: []
+
+default_mobile: ""
+default_code: "-"
+default_pay_password: ""
+
+# 设备地址已在 config/config.yaml，不要传 --usb
+run_args: []
+
+command_timeout: 0
+max_concurrent_tasks: 0

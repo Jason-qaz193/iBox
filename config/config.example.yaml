@@ -1,0 +1,42 @@
+# Copy to config/config.yaml and fill in. Do not commit config/config.yaml.
+
+base_url: "https://sail-api.ibox.art"
+
+# ── 设备连接（本机 / 云端方案 A 都填「Python 能连到的手机地址」）────────────
+#
+# 本机局域网：填手机 WiFi IP，如 192.168.1.88
+# 云端 Tailscale：填手机 Tailscale IP，如 100.64.0.5
+# 云端 frp：填 frp 服务器上映射 27042 的地址（域名或 IP）
+device_host: "192.168.1.88"
+
+# 无线 adb（首发 App 自动点购买/验证码需要）
+# 本机：可与 device_host 相同
+# 云端：Tailscale 同 IP；frp 则填映射 5555 的 host/port
+adb:
+  host: "192.168.1.88"
+  port: 5555
+  # 已 adb connect 后可写死 serial，跳过每次 connect
+  # serial: "192.168.1.88:5555"
+
+login:
+  path: "/personal-center-service/login/mobile"
+  c_id: "your_c_id_here"
+
+sms:
+  path: "/personal-center-service/login/sendSms"
+
+headers:
+  app-version: "2.3.2"
+
+commands:
+  market-info:
+    path: "/public-market-service/digital-collection-groups/{group_id}/purchase-consignment-info?configType={config_type}"
+    defaults:
+      config_type: "0"
+  market-list:
+    path: "/public-market-service/digital-collection-groups/{group_id}/consignment-orders?pageNo={page_no}&pageSize={page_size}&sortType={sort_type}&sortField={sort_field}&uid={uid}"
+    defaults:
+      page_no: "1"
+      page_size: "20"
+      sort_type: "1"
+      sort_field: "1"

@@ -1,12 +1,18 @@
 """
-GeeTest V4 验证码自动求解器（滑块 + 语序点选 phrase）
+GeeTest V4 验证码自动求解器（滑块 + 语序点选 phrase + 九宫格 nine）
+
+  http_solve_sale_rush() — 纯 HTTP 求解（首发抢购，无需手机）：
+    · load (h5) → 图像识别 → verify (web_mobile) → seccode
+
+  sale_rush_solve() — HTTP 优先，Playwright 回退（全自动首发抢购）
 
   playwright_solve() — Playwright 浏览器内自动求解：
     · slide  — 背景差分定位缺口并拖动滑块
     · phrase — 按 geetest_ques_tips 提示图在背景上依次点选（优先购常用）
+    · nine   — 九宫格点选
 
 安装依赖（conda activate ibox 环境下）：
-    pip install playwright Pillow numpy
+    pip install playwright Pillow numpy opencv-python-headless pycryptodome
     playwright install chromium
 """
 
@@ -16,10 +22,18 @@ import asyncio
 import base64
 import io
 import itertools
+import json
 import random
+import re
 import time
 import uuid
 from typing import Optional
+
+try:
+    import requests as _requests
+    _REQUESTS_OK = True
+except ImportError:
+    _REQUESTS_OK = False
 
 # ---- optional deps (fail gracefully) ----------------------------------------
 
@@ -193,11 +207,31 @@ def _extract_gt_images(obj: object, target: dict, _depth: int = 0) -> None:
     imgs = obj.get("imgs")
     if imgs and "imgs" not in target:
         target["imgs"] = imgs
+    ques = obj.get("ques") or obj.get("question")
+    if ques and "ques" not in target:
+        target["ques"] = ques
     captcha_type = obj.get("captcha_type") or obj.get("captchaType")
     if captcha_type and "captcha_type" not in target:
         target["captcha_type"] = captcha_type
     if static and "static_path" not in target:
         target["static_path"] = static
+    # Merge top-level load data (phrase/nine often only expose imgs).
+    if _depth == 0 and isinstance(obj, dict):
+        inner = obj.get("data")
+        if isinstance(inner, dict):
+            for key in (
+                "captcha_type",
+                "imgs",
+                "ques",
+                "lot_number",
+                "payload",
+                "process_token",
+                "static_path",
+                "pt",
+            ):
+                val = inner.get(key)
+                if val and key not in target:
+                    target[key] = val
     if target.get("bg") and target.get("fullbg") and target.get("imgs"):
         return
     for v in obj.values():
@@ -407,7 +441,7 @@ def _find_phrase_clicks_by_hint_columns(
     bg_bytes: bytes,
     *,
     expected_count: int = 3,
-    min_score: float = 0.28,
+    min_score: float = 0.16,
 ) -> list[tuple[int, int]] | None:
     """Match evenly-spaced hint glyphs in the top strip onto the phrase body."""
     if not _CV2_OK or not _PILLOW_OK:
@@ -515,7 +549,7 @@ def _find_phrase_clicks_by_hint_strip(
         res = cv2.matchTemplate(body_gray, tmpl, cv2.TM_CCOEFF_NORMED)
         while True:
             _, max_val, _, max_loc = cv2.minMaxLoc(res)
-            if max_val < 0.30:
+            if max_val < 0.22:
                 return None
             cx = int(max_loc[0] + tw // 2)
             cy = int(max_loc[1] + th // 2 + split_y)
@@ -672,10 +706,10 @@ def _compare_tile_to_prompt(prompt_bytes: bytes, tile_bytes: bytes) -> float:
             pass
 
         return (
-            max(0.0, hist_hsv) * 0.30
+            max(0.0, hist_hsv) * 0.25
             + max(0.0, hist_lab) * 0.20
-            + max(0.0, tmpl_score) * 0.20
-            + akaze_score * 0.30
+            + max(0.0, tmpl_score) * 0.35
+            + akaze_score * 0.20
         )
 
     prompt = Image.open(io.BytesIO(prompt_bytes)).convert("RGB")
@@ -739,6 +773,114 @@ def _nine_pick_combos(
 
 # ── Human-like trajectory ────────────────────────────────────────────────────
 
+_MIN_NINE_TILE_SCORE = 0.18
+
+
+def _nine_combo_min_score(
+    ranked: list[tuple[float, int]],
+    combo: list[int],
+) -> float:
+    if not combo:
+        return 0.0
+    return min(next((sc for sc, ix in ranked if ix == i), 0.0) for i in combo)
+
+
+def _collect_phrase_click_candidates(
+    bg_bytes: bytes,
+    hint_bytes_list: list[bytes] | None = None,
+    *,
+    expected_counts: list[int] | None = None,
+) -> list[tuple[str, list[tuple[int, int]]]]:
+    """Return ordered (method, clicks) candidates for phrase captcha."""
+    counts = expected_counts or [3, 2, 4]
+    hints = hint_bytes_list or _phrase_hint_bytes_from_image(bg_bytes)
+    candidates: list[tuple[str, list[tuple[int, int]]]] = []
+    seen: set[tuple[tuple[int, int], ...]] = set()
+
+    def _add(method: str, clicks: list[tuple[int, int]] | None) -> None:
+        if not clicks or len(clicks) < 2:
+            return
+        key = tuple(clicks)
+        if key in seen:
+            return
+        seen.add(key)
+        candidates.append((method, clicks))
+
+    if hints:
+        _add("hint-template", _find_phrase_clicks_by_hints(bg_bytes, hints))
+    for expected in counts:
+        _add(
+            f"hint-columns({expected})",
+            _find_phrase_clicks_by_hint_columns(bg_bytes, expected_count=expected),
+        )
+        _add(
+            f"hint-strip({expected})",
+            _find_phrase_clicks_by_hint_strip(bg_bytes, expected_count=expected),
+        )
+    for expected in counts:
+        _add(
+            f"reading-order({expected})",
+            _find_phrase_clicks_by_reading_order(bg_bytes, expected_count=expected),
+        )
+    return candidates
+
+
+def _phrase_click_orders(clicks: list[tuple[int, int]], *, method: str) -> list[list[tuple[int, int]]]:
+    if len(clicks) <= 1:
+        return [clicks]
+    if len(clicks) <= 4:
+        orders = [list(order) for order in itertools.permutations(clicks, len(clicks))]
+        return orders[:24]
+    return [clicks]
+
+
+async def _wait_gt_challenge_assets(gt_data: dict, *, timeout_s: float = 12.0) -> None:
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        if gt_data.get("imgs"):
+            return
+        await asyncio.sleep(0.25)
+
+
+async def _locate_phrase_click_target(page):
+    selectors = [
+        "[class*='geetest_subitem'][class*='geetest_click'] [class*='geetest_bg']",
+        "[class*='geetest_click'] [class*='geetest_bg']",
+        "[class*='geetest_subitem'][class*='geetest_click']",
+        "[class*='geetest_click']",
+        "[class*='geetest_bg']",
+    ]
+    for sel in selectors:
+        try:
+            el = page.locator(sel).first
+            await el.wait_for(state="visible", timeout=4_000)
+            box = await el.bounding_box()
+            if box and box["width"] > 10 and box["height"] > 10:
+                return el, box
+        except Exception:
+            continue
+    return None, None
+
+
+async def _fetch_gt_ques_hint_bytes_list(gt_data: dict, page) -> list[bytes]:
+    ques = gt_data.get("ques")
+    if not ques:
+        return []
+    static_path = gt_data.get("static_path")
+    rel_paths: list[str] = []
+    if isinstance(ques, str):
+        rel_paths = [ques]
+    elif isinstance(ques, list):
+        rel_paths = [str(item) for item in ques if item]
+    hints: list[bytes] = []
+    for rel in rel_paths:
+        url = _gt_static_url(static_path, rel)
+        resp = await page.request.get(url)
+        if resp.status < 400:
+            hints.append(await resp.body())
+    return hints
+
+
 def _make_trajectory(start_x: float, end_x: float, y: float, steps: int = 35):
     """
     Return a list of (x, y) waypoints that simulate a human slider drag:
@@ -765,34 +907,45 @@ async def _solve_phrase_challenge(
     gt_data: dict,
     remaining_ms: int,
     max_attempts: int,
+    verify_capture: dict | None = None,
 ) -> dict | None:
     """Solve GeeTest phrase / click-order captcha (优先购常用)."""
-    bg_sel = "[class*='geetest_bg']"
-    await page.wait_for_function(
-        """() => {
-            var bg = document.querySelector('[class*="geetest_bg"]');
-            if (!bg) return false;
-            if (bg.classList.contains('geetest_freeze_action')) return false;
-            if (bg.classList.contains('geetest_freeze_wait')) return false;
-            var bi = window.getComputedStyle(bg).backgroundImage;
-            if (bi && bi !== 'none' && bi.indexOf('url') !== -1) return true;
-            var img = bg.querySelector('img');
-            return !!(img && img.complete && img.naturalWidth > 0);
-        }""",
-        timeout=min(25_000, remaining_ms),
-    )
-    bg_el = page.locator(bg_sel).first
-    bg_box = await bg_el.bounding_box()
-    if not bg_box or bg_box["width"] == 0:
+    verify_capture = verify_capture if verify_capture is not None else {}
+    await _wait_gt_challenge_assets(gt_data, timeout_s=min(12.0, remaining_ms / 1000))
+
+    bg_el, bg_box = await _locate_phrase_click_target(page)
+    if not bg_box:
+        try:
+            await page.wait_for_function(
+                """() => {
+                    var bg = document.querySelector('[class*="geetest_bg"]');
+                    if (!bg) return false;
+                    if (bg.classList.contains('geetest_freeze_action')) return false;
+                    if (bg.classList.contains('geetest_freeze_wait')) return false;
+                    var bi = window.getComputedStyle(bg).backgroundImage;
+                    if (bi && bi !== 'none' && bi.indexOf('url') !== -1) return true;
+                    var img = bg.querySelector('img');
+                    return !!(img && img.complete && img.naturalWidth > 0);
+                }""",
+                timeout=min(20_000, remaining_ms),
+            )
+            bg_el, bg_box = await _locate_phrase_click_target(page)
+        except Exception:
+            pass
+    if not bg_box:
+        bg_el, bg_box = await _locate_phrase_click_target(page)
+    if not bg_box:
         raise RuntimeError("Could not locate geetest_bg element for phrase challenge")
 
     async def _fetch_bg_bytes() -> bytes:
         if gt_data.get("imgs"):
-            url = _gt_static_url(None, str(gt_data["imgs"]))
+            url = _gt_static_url(gt_data.get("static_path"), str(gt_data["imgs"]))
             resp = await page.request.get(url)
             if resp.status >= 400:
                 raise RuntimeError(f"Failed to fetch phrase image: HTTP {resp.status}")
             return await resp.body()
+        if not bg_el or not bg_box:
+            raise RuntimeError("Phrase background element unavailable")
         screenshot = await page.screenshot(clip={
             "x": bg_box["x"], "y": bg_box["y"],
             "width": bg_box["width"], "height": bg_box["height"],
@@ -800,6 +953,9 @@ async def _solve_phrase_challenge(
         return screenshot
 
     async def _fetch_hint_bytes_list() -> list[bytes]:
+        hints = await _fetch_gt_ques_hint_bytes_list(gt_data, page)
+        if hints:
+            return hints
         hint_urls = await page.evaluate("""() => {
             var tips = document.querySelector('[class*="geetest_ques_tips"]');
             if (!tips) return [];
@@ -807,11 +963,11 @@ async def _solve_phrase_challenge(
                 .map(function(i) { return i.src; })
                 .filter(Boolean);
         }""")
-        hints: list[bytes] = []
+        fetched: list[bytes] = []
         for url in hint_urls or []:
             resp = await page.request.get(url)
-            hints.append(await resp.body())
-        return hints
+            fetched.append(await resp.body())
+        return fetched
 
     async def _fetch_target_chars() -> list[str]:
         meta = await page.evaluate("""() => {
@@ -836,35 +992,63 @@ async def _solve_phrase_challenge(
         )
 
     async def _click_phrase_points(clicks_native: list[tuple[int, int]], img_w: int, img_h: int) -> None:
-        box = await bg_el.bounding_box()
-        if not box:
-            raise RuntimeError("geetest_bg bounding box lost")
+        click_el, box = await _locate_phrase_click_target(page)
+        if not click_el or not box:
+            raise RuntimeError("geetest phrase click area lost")
         for cx, cy in clicks_native:
             rel_x = (cx / img_w) * box["width"]
             rel_y = (cy / img_h) * box["height"]
-            await bg_el.click(
-                position={
-                    "x": rel_x + random.uniform(-1.0, 1.0),
-                    "y": rel_y + random.uniform(-1.0, 1.0),
-                },
-                timeout=5_000,
-            )
+            abs_x = box["x"] + rel_x + random.uniform(-1.0, 1.0)
+            abs_y = box["y"] + rel_y + random.uniform(-1.0, 1.0)
+            await page.mouse.click(abs_x, abs_y)
             await asyncio.sleep(random.uniform(0.35, 0.75))
 
-    async def _wait_phrase_result() -> str | None:
+    async def _poll_phrase_success() -> dict | None:
+        if verify_capture.get("lot_number"):
+            return dict(verify_capture)
         try:
-            await page.wait_for_function(
-                "() => document.title === '__solved__' || document.title === '__error__'",
-                timeout=6_000,
+            validate = await page.evaluate(
+                """() => {
+                try {
+                    if (window._captchaResult && window._captchaResult.lot_number) {
+                        return window._captchaResult;
+                    }
+                    if (window._captchaObj && typeof window._captchaObj.getValidate === 'function') {
+                        var v = window._captchaObj.getValidate();
+                        if (v && v.lot_number) return v;
+                    }
+                    var root = document.querySelector('[class*="geetest_captcha"]');
+                    if (root && (root.className || '').indexOf('lock_success') !== -1) {
+                        if (window._captchaObj && typeof window._captchaObj.getValidate === 'function') {
+                            return window._captchaObj.getValidate();
+                        }
+                    }
+                } catch (e) {}
+                return null;
+            }"""
             )
+            if validate and validate.get("lot_number"):
+                return validate
         except Exception:
             pass
         title = await page.title()
-        if title in {"__solved__", "__error__"}:
-            return title
-        # Wrong clicks often trigger shake without changing title immediately.
-        await asyncio.sleep(0.8)
-        return await page.title()
+        if title == "__solved__":
+            result = await page.evaluate("() => window._captchaResult")
+            if result and result.get("lot_number"):
+                return result
+        return None
+
+    async def _wait_phrase_result() -> dict | None:
+        deadline = time.monotonic() + 6.0
+        while time.monotonic() < deadline:
+            solved = await _poll_phrase_success()
+            if solved:
+                return solved
+            await asyncio.sleep(0.25)
+        title = await page.title()
+        if title == "__error__":
+            return {"__error__": True}
+        return None
 
     async def _phrase_expected_counts(title_text: str, hint_bytes_list: list[bytes]) -> list[int]:
         counts: list[int] = []
@@ -887,46 +1071,21 @@ async def _solve_phrase_challenge(
         hint_bytes_list = await _fetch_hint_bytes_list()
         title_text = await _fetch_title_text()
         expected_counts = await _phrase_expected_counts(title_text, hint_bytes_list)
-        clicks = _find_phrase_clicks_by_hints(bg_bytes, hint_bytes_list)
-        method = "hint-template"
-        if clicks is None:
-            for expected in expected_counts:
-                clicks = _find_phrase_clicks_by_hint_columns(
-                    bg_bytes,
-                    expected_count=expected,
-                )
-                if clicks:
-                    method = f"hint-columns({expected})"
-                    break
-        if clicks is None:
+        candidate_sets = _collect_phrase_click_candidates(
+            bg_bytes,
+            hint_bytes_list,
+            expected_counts=expected_counts,
+        )
+        if not candidate_sets:
             target_chars = await _fetch_target_chars()
-            clicks = _find_phrase_clicks_by_ocr(bg_bytes, target_chars)
-            method = "ocr"
-        if clicks is None:
-            for expected in expected_counts:
-                clicks = _find_phrase_clicks_by_hint_strip(
-                    bg_bytes,
-                    expected_count=expected,
-                )
-                if clicks:
-                    method = f"hint-strip({expected})"
-                    break
-        if clicks is None:
-            for expected in expected_counts:
-                clicks = _find_phrase_clicks_by_reading_order(
-                    bg_bytes,
-                    expected_count=expected,
-                )
-                if clicks:
-                    method = f"reading-order({expected})"
-                    break
+            ocr_clicks = _find_phrase_clicks_by_ocr(bg_bytes, target_chars)
+            if ocr_clicks:
+                candidate_sets = [("ocr", ocr_clicks)]
 
-        click_orders: list[list[tuple[int, int]]] = []
-        if clicks:
-            if method.startswith("reading-order") and len(clicks) <= 4:
-                click_orders = [list(p) for p in itertools.permutations(clicks, len(clicks))]
-            else:
-                click_orders = [clicks]
+        click_orders: list[tuple[str, list[tuple[int, int]]]] = []
+        for method, clicks in candidate_sets:
+            for order in _phrase_click_orders(clicks, method=method):
+                click_orders.append((method, order))
 
         if not click_orders:
             raise RuntimeError(
@@ -934,24 +1093,22 @@ async def _solve_phrase_challenge(
                 f"(hints={len(hint_bytes_list)}, ddddocr={_DDDDOCR_OK}, cv2={_CV2_OK})"
             )
 
-        for order_idx, click_order in enumerate(click_orders[:12], start=1):
+        for order_idx, (method, click_order) in enumerate(click_orders[:36], start=1):
+            verify_capture.clear()
             print(
                 f"[geetest] phrase attempt {attempt}/{max_attempts} "
-                f"({method}) order {order_idx}/{min(len(click_orders), 12)}: "
+                f"({method}) order {order_idx}/{min(len(click_orders), 36)}: "
                 f"{len(click_order)} clicks on {img_w}x{img_h}"
             )
             await _click_phrase_points(click_order, img_w, img_h)
-            title = await _wait_phrase_result()
-            if title == "__solved__":
-                result = await page.evaluate("() => window._captchaResult")
-                if result and result.get("lot_number"):
-                    return result
-                raise RuntimeError(f"Phrase solved but result empty: {result}")
-            if title == "__error__":
+            result = await _wait_phrase_result()
+            if isinstance(result, dict) and result.get("__error__"):
                 err = await page.evaluate("() => window._captchaError || 'unknown'")
                 raise RuntimeError(f"GeeTest phrase error: {err}")
-            if order_idx < min(len(click_orders), 12):
-                await asyncio.sleep(0.6)
+            if result and result.get("lot_number"):
+                return result
+            if order_idx < min(len(click_orders), 36):
+                await asyncio.sleep(0.5)
 
         if attempt < max_attempts:
             print(f"[geetest] Phrase attempt {attempt} failed, refreshing challenge…")
@@ -994,8 +1151,10 @@ async def _solve_nine_challenge(
     gt_data: dict,
     remaining_ms: int,
     max_attempts: int,
+    verify_capture: dict | None = None,
 ) -> dict | None:
     """Solve GeeTest nine-grid captcha: pick N tiles matching the prompt icon."""
+    verify_capture = verify_capture if verify_capture is not None else {}
     await page.wait_for_function(
         """() => {
             var prompt = document.querySelector('[class*="geetest_ques_tips"] img');
@@ -1095,14 +1254,18 @@ async def _solve_nine_challenge(
 
     async def _fetch_tile_bytes_list() -> list[bytes]:
         if gt_data.get("imgs"):
-            url = _gt_static_url(None, str(gt_data["imgs"]))
+            url = _gt_static_url(gt_data.get("static_path"), str(gt_data["imgs"]))
             resp = await page.request.get(url)
             if resp.status < 400:
                 split_tiles = _split_nine_grid_image(await resp.body())
                 if len(split_tiles) == 9:
                     return split_tiles
-        await asyncio.sleep(0.6)
-        return await _capture_tile_bytes_list()
+        for _ in range(4):
+            tiles = await _capture_tile_bytes_list()
+            if len([t for t in tiles if t]) >= 9:
+                return tiles
+            await asyncio.sleep(0.5)
+        return tiles
 
     async def _refresh_nine_grid() -> None:
         gt_data.clear()
@@ -1144,21 +1307,46 @@ async def _solve_nine_challenge(
         select_count = _parse_nine_select_count(str(snap.get("title") or ""))
         prompt_bytes = await (await page.request.get(prompt_url)).body()
         tile_bytes_list = await _fetch_tile_bytes_list()
-        if len([t for t in tile_bytes_list if t]) < 9:
-            raise RuntimeError(f"Nine-grid tile images incomplete ({len(tile_bytes_list)})")
+        valid_tiles = [t for t in tile_bytes_list if t]
+        if len(valid_tiles) < 9:
+            print(
+                f"[geetest] nine attempt {attempt}/{max_attempts}: "
+                f"only {len(valid_tiles)} tiles ready, refreshing…",
+                flush=True,
+            )
+            if attempt < max_attempts:
+                await _refresh_nine_grid()
+            continue
 
         ranked = _rank_nine_tiles(prompt_bytes, tile_bytes_list)
+        min_score = _MIN_NINE_TILE_SCORE if attempt <= 4 else max(0.10, _MIN_NINE_TILE_SCORE - 0.04 * (attempt - 4))
         pick_combos = _nine_pick_combos(
             prompt_bytes,
             tile_bytes_list,
             select_count=select_count,
-            top_k=6,
-            max_combos=1,
+            top_k=9,
+            max_combos=12,
         )
+        pick_combos = [
+            combo
+            for combo in pick_combos
+            if _nine_combo_min_score(ranked, combo) >= min_score
+        ]
         if not pick_combos:
-            pick_combos = [_find_nine_matching_indices(
+            fallback = _find_nine_matching_indices(
                 prompt_bytes, tile_bytes_list, select_count=select_count
-            )]
+            )
+            if fallback and (attempt >= max_attempts or _nine_combo_min_score(ranked, fallback) >= min_score):
+                pick_combos = [fallback]
+
+        if not pick_combos:
+            print(
+                f"[geetest] nine attempt {attempt}/{max_attempts}: "
+                f"tile scores too low (min={min_score:.2f}), refreshing…"
+            )
+            if attempt < max_attempts:
+                await _refresh_nine_grid()
+            continue
 
         for combo_idx, pick_indices in enumerate(pick_combos, start=1):
             if not pick_indices:
@@ -1180,17 +1368,21 @@ async def _solve_nine_challenge(
                 await asyncio.sleep(random.uniform(0.35, 0.75))
 
             await _submit_nine_selection()
-            await asyncio.sleep(0.4)
+            verify_capture.clear()
 
-            title = await _wait_nine_result()
-            if title == "__solved__":
-                result = await page.evaluate("() => window._captchaResult")
-                if result and result.get("lot_number"):
-                    return result
-                raise RuntimeError(f"Nine-grid solved but result empty: {result}")
-            if title == "__error__":
-                err = await page.evaluate("() => window._captchaError || 'unknown'")
-                raise RuntimeError(f"GeeTest nine-grid error: {err}")
+            deadline = time.monotonic() + 8.0
+            while time.monotonic() < deadline:
+                if verify_capture.get("lot_number"):
+                    return dict(verify_capture)
+                title = await page.title()
+                if title == "__solved__":
+                    result = await page.evaluate("() => window._captchaResult")
+                    if result and result.get("lot_number"):
+                        return result
+                if title == "__error__":
+                    err = await page.evaluate("() => window._captchaError || 'unknown'")
+                    raise RuntimeError(f"GeeTest nine-grid error: {err}")
+                await asyncio.sleep(0.25)
 
         if attempt < max_attempts:
             print(f"[geetest] Nine-grid attempt {attempt} failed, refreshing…")
@@ -1199,13 +1391,336 @@ async def _solve_nine_challenge(
     return None
 
 
+# ── HTTP sale-rush solver (no phone / no browser UI) ─────────────────────────
+
+def _geetest_callback() -> str:
+    return f"geetest_{int(random.random() * 10000) + int(time.time() * 1000)}"
+
+
+def _http_load_captcha(
+    captcha_id: str,
+    *,
+    session: object | None = None,
+) -> tuple[dict, object]:
+    if not _REQUESTS_OK:
+        raise ImportError("requests not installed")
+    sess = session or _requests.Session()
+    sess.headers.setdefault("User-Agent", _MOBILE_UA)
+    challenge = str(uuid.uuid4())
+    callback = _geetest_callback()
+    resp = sess.get(
+        "https://gcaptcha4.geetest.com/load",
+        params={
+            "callback": callback,
+            "captcha_id": captcha_id,
+            "challenge": challenge,
+            "client_type": "h5",
+            "lang": "zh-cn",
+        },
+        timeout=15,
+    )
+    resp.raise_for_status()
+    payload = _parse_geetest_json(resp.text)
+    data = payload.get("data") or {}
+    if not data.get("lot_number"):
+        raise RuntimeError(f"GeeTest load failed: {payload}")
+    return data, sess
+
+
+def _http_fetch_image(url: str, session: object) -> bytes:
+    resp = session.get(url, timeout=15)
+    resp.raise_for_status()
+    return resp.content
+
+
+def _phrase_hint_bytes_from_image(img_bytes: bytes, *, count: int = 3) -> list[bytes]:
+    if not _PILLOW_OK:
+        return []
+    img = Image.open(io.BytesIO(img_bytes))
+    w, h = img.size
+    strip = img.crop((0, 0, w, max(int(h * 0.22), 30)))
+    col_w = max(w // count, 1)
+    hints: list[bytes] = []
+    for idx in range(count):
+        part = strip.crop((idx * col_w, 0, min((idx + 1) * col_w, w), strip.height))
+        buf = io.BytesIO()
+        part.save(buf, format="PNG")
+        hints.append(buf.getvalue())
+    return hints
+
+
+def _solve_phrase_clicks_http(img_bytes: bytes) -> list[tuple[int, int]] | None:
+    hints = _phrase_hint_bytes_from_image(img_bytes)
+    finders = (
+        lambda: _find_phrase_clicks_by_hint_columns(img_bytes, expected_count=3),
+        lambda: _find_phrase_clicks_by_hint_strip(img_bytes, expected_count=3),
+        lambda: _find_phrase_clicks_by_hints(img_bytes, hints) if hints else None,
+        lambda: _find_phrase_clicks_by_reading_order(img_bytes, expected_count=3),
+    )
+    for finder in finders:
+        clicks = finder()
+        if clicks and len(clicks) >= 2:
+            return clicks
+    return None
+
+
+def _solve_nine_clicks_http(img_bytes: bytes, *, select_count: int = 2) -> list[int] | None:
+    if not _PILLOW_OK:
+        return None
+    img = Image.open(io.BytesIO(img_bytes))
+    w, h = img.size
+    prompt_h = max(int(h * 0.22), 40)
+    prompt = img.crop((0, 0, w, prompt_h))
+    grid = img.crop((0, prompt_h, w, h))
+    prompt_bytes = _image_bytes_png(prompt)
+    grid_bytes = _image_bytes_png(grid)
+    tiles = _split_nine_grid_image(grid_bytes)
+    if len(tiles) != 9:
+        return None
+    combos = _nine_pick_combos(
+        prompt_bytes,
+        tiles,
+        select_count=select_count,
+        top_k=8,
+        max_combos=6,
+    )
+    combos = [
+        combo
+        for combo in combos
+        if _nine_combo_min_score(_rank_nine_tiles(prompt_bytes, tiles), combo) >= _MIN_NINE_TILE_SCORE
+    ]
+    if combos:
+        return list(combos[0])
+    fallback = _find_nine_matching_indices(prompt_bytes, tiles, select_count=select_count)
+    return list(fallback) if fallback else None
+
+
+def _image_bytes_png(img: Image.Image) -> bytes:
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    return buf.getvalue()
+
+
+def _nine_indices_to_userresponse(
+    indices: list[int],
+    *,
+    img_w: int,
+    img_h: int,
+    prompt_h: int,
+) -> list[list[float]]:
+    gw, gh = img_w, max(img_h - prompt_h, 1)
+    cell_w, cell_h = gw / 3, gh / 3
+    points: list[list[float]] = []
+    for idx in indices:
+        row, col = divmod(idx, 3)
+        points.append(
+            [
+                (col + 0.5) * cell_w,
+                prompt_h + (row + 0.5) * cell_h,
+            ]
+        )
+    return points
+
+
+def _http_verify_captcha(
+    load_data: dict,
+    captcha_id: str,
+    userresponse: object,
+    *,
+    session: object,
+) -> dict | None:
+    from .geetest_sign import GeetestSigner
+
+    w = GeetestSigner.generate_w(load_data, captcha_id, userresponse=userresponse)
+    callback = _geetest_callback()
+    resp = session.get(
+        "https://gcaptcha4.geetest.com/verify",
+        params={
+            "callback": callback,
+            "captcha_id": captcha_id,
+            "client_type": "web_mobile",
+            "lot_number": load_data["lot_number"],
+            "payload": load_data["payload"],
+            "process_token": load_data["process_token"],
+            "payload_protocol": "1",
+            "pt": load_data.get("pt") or "1",
+            "w": w,
+        },
+        timeout=15,
+    )
+    resp.raise_for_status()
+    payload = _parse_geetest_json(resp.text)
+    data = payload.get("data") or {}
+    if data.get("result") == "success" and data.get("seccode"):
+        return data["seccode"]
+    return None
+
+
+def _seccode_to_captcha_params(seccode: dict, captcha_id: str) -> dict:
+    return {
+        "captcha_id": seccode.get("captcha_id") or captcha_id,
+        "lot_number": seccode.get("lot_number", ""),
+        "pass_token": seccode.get("pass_token", ""),
+        "gen_time": str(seccode.get("gen_time", "")),
+        "captcha_output": seccode.get("captcha_output", ""),
+    }
+
+
+def http_solve_sale_rush(
+    captcha_id: str = CAPTCHA_ID_IBOX,
+    *,
+    max_attempts: int = 12,
+) -> dict:
+    """
+    Solve GeeTest for iBox sale-rush via direct HTTP (load → image solve → verify).
+
+    No phone or adb required. Uses client_type=h5 for load and web_mobile for verify,
+    matching the real App WebView capture flow.
+    """
+    if not _REQUESTS_OK:
+        raise ImportError("requests not installed")
+    if not _PILLOW_OK:
+        raise ImportError("Pillow/numpy required for HTTP captcha solve")
+
+    last_err = "no attempts"
+    session = _requests.Session()
+    session.headers.update(
+        {
+            "User-Agent": _MOBILE_UA,
+            "Referer": "https://detail-page.ibox.art/",
+            "Origin": "https://detail-page.ibox.art",
+            "Accept": "*/*",
+        }
+    )
+
+    for attempt in range(1, max_attempts + 1):
+        try:
+            if attempt > 1:
+                time.sleep(0.8)
+            load_data, session = _http_load_captcha(captcha_id, session=session)
+            captcha_type = str(load_data.get("captcha_type") or "phrase")
+            imgs = load_data.get("imgs")
+            if not imgs:
+                last_err = "load response missing imgs"
+                continue
+
+            img_url = _gt_static_url(load_data.get("static_path"), str(imgs))
+            img_bytes = _http_fetch_image(img_url, session)
+
+            verify_jobs: list[tuple[str, object]] = []
+            if captcha_type == "nine":
+                ranked = None
+                img = Image.open(io.BytesIO(img_bytes))
+                w, h = img.size
+                prompt_h = max(int(h * 0.22), 40)
+                prompt = img.crop((0, 0, w, prompt_h))
+                grid = img.crop((0, prompt_h, w, h))
+                tiles = _split_nine_grid_image(_image_bytes_png(grid))
+                if len(tiles) == 9:
+                    ranked = _rank_nine_tiles(_image_bytes_png(prompt), tiles)
+                    combos = _nine_pick_combos(
+                        _image_bytes_png(prompt),
+                        tiles,
+                        select_count=2,
+                        top_k=10,
+                        max_combos=12,
+                    )
+                    for combo in combos:
+                        verify_jobs.append(
+                            (
+                                f"nine-pick={combo}",
+                                _nine_indices_to_userresponse(
+                                    list(combo), img_w=w, img_h=h, prompt_h=prompt_h
+                                ),
+                            )
+                        )
+            else:
+                for method, clicks in _collect_phrase_click_candidates(img_bytes):
+                    for order in _phrase_click_orders(clicks, method=method):
+                        verify_jobs.append(
+                            (method, [[int(x), int(y)] for x, y in order])
+                        )
+
+            if not verify_jobs:
+                last_err = f"could not resolve {captcha_type} click targets"
+                continue
+
+            for job_idx, (label, userresponse) in enumerate(verify_jobs[:48], start=1):
+                print(
+                    f"[geetest] HTTP {captcha_type} load={attempt} "
+                    f"try {job_idx}/{min(len(verify_jobs), 48)}: {label}",
+                    flush=True,
+                )
+                seccode = _http_verify_captcha(
+                    load_data,
+                    captcha_id,
+                    userresponse,
+                    session=session,
+                )
+                if seccode and seccode.get("pass_token"):
+                    params = _seccode_to_captcha_params(seccode, captcha_id)
+                    print(
+                        f"[geetest] HTTP solved ✓ lot_number={params['lot_number'][:8]}…",
+                        flush=True,
+                    )
+                    return params
+            last_err = f"verify rejected ({captcha_type})"
+        except _requests.HTTPError as exc:
+            last_err = str(exc)
+            print(f"[geetest] HTTP attempt {attempt}/{max_attempts} failed: {exc}", flush=True)
+            if exc.response is not None and exc.response.status_code in (403, 429):
+                raise RuntimeError(f"GeeTest rate-limited HTTP load: {exc}") from exc
+        except Exception as exc:
+            last_err = str(exc)
+            print(f"[geetest] HTTP attempt {attempt}/{max_attempts} failed: {exc}", flush=True)
+
+    raise RuntimeError(f"HTTP sale-rush captcha failed after {max_attempts} attempts: {last_err}")
+
+
+def sale_rush_solve(
+    captcha_id: str = CAPTCHA_ID_IBOX,
+    *,
+    timeout: float = 60.0,
+    headed: bool = False,
+    max_http_attempts: int = 6,
+    max_playwright_retries: int = 2,
+) -> dict:
+    """
+    Fully automated sale-rush captcha: HTTP first (fast, no phone), Playwright fallback.
+    """
+    try:
+        return http_solve_sale_rush(captcha_id, max_attempts=max_http_attempts)
+    except Exception as http_err:
+        if max_playwright_retries <= 0:
+            raise RuntimeError(f"HTTP sale-rush captcha failed: {http_err}") from http_err
+        print(f"[geetest] HTTP solve exhausted ({http_err}); trying Playwright…", flush=True)
+
+    return playwright_solve(
+        captcha_id=captcha_id,
+        timeout=timeout,
+        headed=headed,
+        max_retries=max_playwright_retries,
+        max_slider_attempts=15,
+        sale_rush=True,
+    )
+
+
 # ── Playwright async core ─────────────────────────────────────────────────────
+
+def _patch_geetest_client_type(url: str, client_type: str) -> str:
+    if "client_type=" in url:
+        return re.sub(r"client_type=[^&]+", f"client_type={client_type}", url)
+    sep = "&" if "?" in url else "?"
+    return f"{url}{sep}client_type={client_type}"
+
 
 async def _solve_async(
     captcha_id: str,
     timeout_ms: int,
     headed: bool,
     max_slider_attempts: int,
+    *,
+    sale_rush: bool = False,
 ) -> dict:
     if not _PLAYWRIGHT_OK:
         raise ImportError(
@@ -1252,6 +1767,7 @@ async def _solve_async(
         # under 'data', plus 'static_path' as CDN base.  Diffing the two images
         # gives the exact gap position without any heuristics.
         _gt_data: dict = {}
+        _verify_capture: dict = {}
 
         import json as _json_mod
 
@@ -1262,15 +1778,48 @@ async def _solve_async(
         async def _intercept_gt_load(route) -> None:
             try:
                 req_url = route.request.url
-                if "client_type=" not in req_url:
-                    sep = "&" if "?" in req_url else "?"
-                    req_url = f"{req_url}{sep}client_type=h5"
+                req_url = _patch_geetest_client_type(req_url, "h5")
                 response = await route.fetch(url=req_url)
                 try:
                     body_bytes = await response.body()
                     body_text = body_bytes.decode("utf-8", errors="replace")
                     js = _parse_geetest_json(body_text)
                     _extract_gt_images(js, _gt_data)
+                    data = js.get("data")
+                    if isinstance(data, dict):
+                        for key, val in data.items():
+                            if val is not None and val != "" and key not in _gt_data:
+                                _gt_data[key] = val
+                except Exception:
+                    pass
+                await route.fulfill(response=response)
+            except Exception:
+                await route.continue_()
+
+        async def _intercept_gt_verify(route) -> None:
+            try:
+                req_url = route.request.url
+                if sale_rush:
+                    req_url = _patch_geetest_client_type(req_url, "web_mobile")
+                response = await route.fetch(url=req_url)
+                try:
+                    body_bytes = await response.body()
+                    body_text = body_bytes.decode("utf-8", errors="replace")
+                    parsed = _parse_geetest_json(body_text)
+                    data = parsed.get("data") or {}
+                    if data.get("result") == "success" and data.get("seccode"):
+                        seccode = data["seccode"]
+                        _verify_capture.clear()
+                        _verify_capture.update(_seccode_to_captcha_params(seccode, captcha_id))
+                        title = await page.title()
+                        if title != "__solved__":
+                            await page.evaluate(
+                                """(result) => {
+                                window._captchaResult = result;
+                                document.title = '__solved__';
+                            }""",
+                                _verify_capture,
+                            )
                 except Exception:
                     pass
                 await route.fulfill(response=response)
@@ -1280,6 +1829,10 @@ async def _solve_async(
         await page.route(
             lambda url: "geetest.com" in url and "/load" in url,
             _intercept_gt_load,
+        )
+        await page.route(
+            lambda url: "geetest.com" in url and "/verify" in url,
+            _intercept_gt_verify,
         )
 
         print("[geetest] Launching browser and loading GeeTest widget…")
@@ -1331,6 +1884,30 @@ async def _solve_async(
                 return 'unknown';
             }""")
 
+        async def _reset_stale_geetest_widget() -> None:
+            stale = await page.evaluate(
+                """() => {
+                var root = document.querySelector('[class*="geetest_captcha"]');
+                if (!root) return false;
+                if ((root.className || '').indexOf('lock_success') !== -1) return true;
+                var bg = document.querySelector('[class*="geetest_bg"]');
+                if (bg && (bg.className || '').indexOf('freeze_action') !== -1) return true;
+                return false;
+            }"""
+            )
+            if not stale:
+                return
+            print("[geetest] Stale/locked widget detected, clicking refresh…", flush=True)
+            _gt_data.clear()
+            try:
+                await page.locator("[class*='geetest_refresh']").first.click(timeout=3_000)
+            except Exception:
+                try:
+                    await page.locator("[class*='geetest_btn']").first.click(timeout=3_000)
+                except Exception:
+                    pass
+            await asyncio.sleep(1.5)
+
         async def _wait_challenge_ready() -> None:
             print("[geetest] Waiting for challenge to load…")
             await page.wait_for_function(
@@ -1365,11 +1942,11 @@ async def _solve_async(
                             if (bg.classList.contains('geetest_freeze_action')) return false;
                             var bi = window.getComputedStyle(bg).backgroundImage;
                             if (bi && bi !== 'none' && bi.indexOf('url') !== -1) return true;
+                            var img = bg.querySelector('img');
+                            if (img && img.complete && img.naturalWidth > 0) return true;
                         }
                         var tips = document.querySelector('[class*="geetest_ques_tips"]');
                         if (tips && tips.children.length) return true;
-                        var img = document.querySelector('[class*="geetest_bg"] img');
-                        if (img && img.complete && img.naturalWidth > 0) return true;
                     }
                     if (!root.classList.contains('geetest_freeze_wait')) return true;
                     if (root.classList.contains('geetest_nextReady')) return true;
@@ -1379,6 +1956,8 @@ async def _solve_async(
             )
 
         await asyncio.sleep(1.0)
+        await _wait_gt_challenge_assets(_gt_data, timeout_s=8.0)
+        await _reset_stale_geetest_widget()
         challenge_type = await _detect_challenge_type()
         print(f"[geetest] Challenge type: {challenge_type!r} (api={_gt_data.get('captcha_type')!r})")
 
@@ -1408,6 +1987,7 @@ async def _solve_async(
                 gt_data=_gt_data,
                 remaining_ms=remaining_ms,
                 max_attempts=max_slider_attempts,
+                verify_capture=_verify_capture,
             )
             await browser.close()
             if result and result.get("lot_number"):
@@ -1415,16 +1995,41 @@ async def _solve_async(
             raise RuntimeError(f"Nine-grid challenge failed: {result}")
 
         if is_phrase:
-            result = await _solve_phrase_challenge(
-                page=page,
-                gt_data=_gt_data,
-                remaining_ms=remaining_ms,
-                max_attempts=max_slider_attempts,
-            )
+            last_phrase_err: Exception | None = None
+            for phrase_round in range(1, 4):
+                try:
+                    result = await _solve_phrase_challenge(
+                        page=page,
+                        gt_data=_gt_data,
+                        remaining_ms=remaining_ms,
+                        max_attempts=max_slider_attempts,
+                        verify_capture=_verify_capture,
+                    )
+                    await browser.close()
+                    if result and result.get("lot_number"):
+                        return result
+                    raise RuntimeError(f"Phrase challenge failed: {result}")
+                except Exception as exc:
+                    last_phrase_err = exc
+                    if phrase_round >= 3:
+                        break
+                    print(
+                        f"[geetest] Phrase round {phrase_round} failed ({exc}); "
+                        "refreshing challenge in same browser…",
+                        flush=True,
+                    )
+                    _gt_data.clear()
+                    try:
+                        await page.locator("[class*='geetest_refresh']").first.click(timeout=3_000)
+                    except Exception:
+                        try:
+                            await page.locator("[class*='geetest_btn']").first.click(timeout=3_000)
+                        except Exception:
+                            pass
+                    await asyncio.sleep(2.0)
+                    await _wait_gt_challenge_assets(_gt_data, timeout_s=8.0)
             await browser.close()
-            if result and result.get("lot_number"):
-                return result
-            raise RuntimeError(f"Phrase challenge failed: {result}")
+            raise RuntimeError(f"Phrase challenge failed: {last_phrase_err}") from last_phrase_err
 
         if challenge_type != "slide":
             raise RuntimeError(
@@ -1628,8 +2233,10 @@ def playwright_solve(
     captcha_id: str = CAPTCHA_ID_IBOX,
     timeout: float = 60.0,
     headed: bool = False,
-    max_retries: int = 3,
-    max_slider_attempts: int = 6,
+    max_retries: int = 2,
+    max_slider_attempts: int = 10,
+    *,
+    sale_rush: bool = False,
 ) -> dict:
     """
     Solve a GeeTest V4 slider captcha using a Playwright Chromium browser.
@@ -1655,6 +2262,7 @@ def playwright_solve(
                         timeout_ms=int(timeout * 1000),
                         headed=headed,
                         max_slider_attempts=max_slider_attempts,
+                        sale_rush=sale_rush,
                     )
                 )
             except Exception as exc:

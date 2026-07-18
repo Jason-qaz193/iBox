@@ -1,0 +1,27 @@
+# frp client — run at HOME on a device that can reach the phone (NAS/树莓派/常开电脑).
+# Phone local IP example: 192.168.1.88
+#
+#   ./frpc -c deploy/tencent-cvm/frpc.home.toml
+#
+# Then on CVM config/config.yaml:
+#   device_host: "<CVM公网IP>"
+#   adb.host: "<CVM公网IP>"
+#   adb.port: 15555
+
+serverAddr = "你的腾讯云CVM公网IP"
+serverPort = 7000
+auth.token = "CHANGE_ME_STRONG_TOKEN"
+
+[[proxies]]
+name = "ibox-rpc"
+type = "tcp"
+localIP = "192.168.1.88"
+localPort = 27042
+remotePort = 27042
+
+[[proxies]]
+name = "ibox-adb"
+type = "tcp"
+localIP = "192.168.1.88"
+localPort = 5555
+remotePort = 15555

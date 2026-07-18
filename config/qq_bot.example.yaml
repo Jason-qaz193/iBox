@@ -24,9 +24,11 @@ default_mobile: "18935209286"
 default_code: "-"
 default_pay_password: ""
 
-# 传给 run.py 的额外参数（与 config.yaml 里 USB 模式一致）
-run_args:
-  - "--usb"
+# 云端混合部署（方案 A）：device_host 填 Tailscale/frp 地址，不要用 --usb
+# run_args:
+#   - "--host"
+#   - "100.64.0.5"
+run_args: []
 
 # 单条指令最长执行时间（秒）；0 = 不限制（捡漏/合成等长任务可一直运行）
 command_timeout: 0
@@ -34,14 +36,10 @@ command_timeout: 0
 # 同时运行的任务数上限；0 或不填 = 不限制（不同账号可并行）
 max_concurrent_tasks: 0
 
-# 点对点全自动：B 寄售后自动触发 A 购买（按寄售ID|藏品ID 批量直购）
-# 键为卖家手机号；也可写成列表形式（见注释）
+# 点对点全自动（可选）：B 仅发「寄售-...」时自动触发 A 购买；合并指令「点对点-B-A-...」无需此项
 # p2p_auto:
-#   "19965260715":
-#     buyer_mobile: "13800138000"
-#     buyer_code: "-"
-#     buyer_pay_password: "123456"
-# p2p_auto:
-#   - seller: "19965260715"
-#     buyer_mobile: "13800138000"
-#     buyer_pay_password: "123456"
+#   enabled: true
+#   seller_mobile: "19965260715"
+#   buyer_mobile: "18935209286"
+#   buyer_code: "-"
+#   buyer_pay_password: ""
