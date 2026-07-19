@@ -4577,6 +4577,18 @@ def should_retry_synthesis_submit(result: dict | None) -> bool:
     if code == 0:
         return False
 
+    # Business "not open yet" / clock skew at the exact open second — keep retrying
+    # inside the submit window instead of giving up on the first attempt.
+    message = " ".join(
+        str(part)
+        for part in (result.get("message"), result.get("msg"), result.get("error"))
+        if part not in (None, "")
+    )
+    if "活动未开始" in message or "未开始" in message:
+        return True
+    if str(code) in {"500006", "500007"}:
+        return True
+
     if code is not None:
         return str(code) in {"429", "500", "502", "503", "504"}
 
